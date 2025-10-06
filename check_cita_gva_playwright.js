@@ -1,6 +1,5 @@
 // check_cita_gva_playwright.js
-// Ejecuta en runner self-hosted usando CHROME real (channel) y con "stealth" básico.
-// Graba VIDEO y TRACING para depurar si la SPA se queda cargando.
+// SPA GVA: Chrome real + "stealth" + espera por red + reintentos + vídeo + traza.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -12,8 +11,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
-  HEADLESS = "true",
-  BROWSER_CHANNEL = "", // "chrome" para usar Google Chrome si existe
+  HEADLESS = "false",        // puedes forzarlo desde el workflow
+  BROWSER_CHANNEL = "chrome" // usa tu Google Chrome si está instalado
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -22,6 +21,8 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
 }
 
 const timeout = Number(TIMEOUT_MS) || 180000;
+
+/* ---------------- utilidades ---------------- */
 
 async function notifyTelegram(message, screenshotPath) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -74,16 +75,24 @@ async function waitMaskGone(scope, maxMs = 45000) {
       if (scope.waitForLoadState) {
         await scope.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
       }
-      await new Promise(r => setTimeout(r, 700));
+      await new Promise(r => setTimeout(r, 600));
       return true;
     }
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 350));
   }
   return false;
 }
 
+async function humanNudge(page) {
+  // Pequeños gestos para “desatascar” SPAs quisquillosas
+  await page.mouse.move(200, 200).catch(()=>{});
+  await page.mouse.wheel(0, 800).catch(()=>{});
+  await page.keyboard.press("Escape").catch(()=>{});
+  await page.waitForTimeout(400);
+}
+
 async function clickCTA(scope) {
-  const locs = [
+  const candidates = [
     scope.getByText(/Solicitar cita previa/i).first(),
     scope.locator('button:has-text("Solicitar cita previa")').first(),
     scope.locator('a:has-text("Solicitar cita previa")').first(),
@@ -91,32 +100,46 @@ async function clickCTA(scope) {
     scope.locator('button:has-text("Cita previa")').first(),
     scope.locator('a:has-text("Cita previa")').first(),
   ];
-  for (const l of locs) {
-    const v = await l.isVisible().catch(() => false);
-    if (v) { await l.scrollIntoViewIfNeeded().catch(()=>{}); await l.click({ timeout: 10000 }).catch(() => {}); return true; }
+  // doble intento por si el primer click no “engancha”
+  for (let pass = 0; pass < 2; pass++) {
+    for (const l of candidates) {
+      const v = await l.isVisible().catch(() => false);
+      if (v) {
+        await l.scrollIntoViewIfNeeded().catch(()=>{});
+        await l.click({ timeout: 8000 }).catch(()=>{});
+        await humanNudge(scope.page || scope);
+        return true;
+      }
+    }
+    await humanNudge(scope.page || scope);
   }
   return false;
 }
 
-async function pressHome(scope) {
-  const home = scope.locator(".home").first();
-  const v = await home.isVisible().catch(() => false);
-  if (v) { await home.click({ timeout: 5000 }).catch(() => {}); await scope.waitForTimeout(800); return true; }
-  return false;
-}
-
-async function waitAppointmentScreen(scope, totalWaitMs = 80000) {
-  const probes = [
-    /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
-    /Siguiente|Següent/i, /Centre i servei/i, /Seleccione centre|servei/i,
-  ];
+async function waitAppointmentScreen(scope, totalWaitMs = 90000) {
+  // Espera por UI o por red (cualquier señal razonable de que “cambió de vista”)
   const end = Date.now() + totalWaitMs;
+  const uiProbes = [
+    /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
+    /Siguiente|Següent/i, /Centre i servei/i, /Seleccione centre|servei/i
+  ];
   while (Date.now() < end) {
     const gone = await waitMaskGone(scope, 5000);
-    for (const re of probes) {
+    // 1) Señales de UI
+    for (const re of uiProbes) {
       const loc = scope.locator(`text=/${re.source}/${re.flags}`).first();
       if (await loc.isVisible().catch(() => false)) return true;
     }
+    // 2) Señales de red (cualquier XHR/fetch a “cita”, “appointment”, “slot”, “centro”, “servicio”)
+    const ok = await scope.waitForResponse(
+      (res) => {
+        const u = res.url();
+        return /cita|appointment|slot|centro|servicio/i.test(u) && res.status() < 500;
+      },
+      { timeout: 2500 }
+    ).then(()=>true).catch(()=>false);
+    if (ok) return true;
+
     if (!gone) await scope.waitForTimeout(600);
   }
   return false;
@@ -155,11 +178,12 @@ async function checkAvailability(scope) {
   return (await clickableDays.count()) > 0;
 }
 
+/* ---------------- main ---------------- */
+
 async function run() {
-  // Usa Chrome real si está disponible
   const browser = await chromium.launch({
     headless: HEADLESS.toLowerCase() === "true",
-    channel: BROWSER_CHANNEL || undefined, // "chrome"
+    channel: BROWSER_CHANNEL || undefined,
     args: [
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
@@ -167,7 +191,6 @@ async function run() {
     ],
   });
 
-  // Contexto con vídeo y traza
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
     locale: "es-ES",
@@ -185,12 +208,15 @@ async function run() {
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
   const page = await context.newPage();
+
+  // logs de red (se ven en el job)
   page.on("requestfailed", (req) =>
     console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText)
   );
 
   try {
     let attempt = 0, ready = false;
+
     while (attempt < 3 && !ready) {
       attempt++;
       console.log(`== Intento ${attempt} ==`);
@@ -199,19 +225,26 @@ async function run() {
       await waitMaskGone(page, 20000);
       await closeCookiesIfAny(page);
 
-      const ctaOk = await clickCTA(page);
-      if (!ctaOk) {
+      // Clic CTA (hasta dos veces)
+      const cta1 = await clickCTA(page);
+      if (!cta1) {
         await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`home_${attempt}.html`, await page.content());
-        await pressHome(page);
         continue;
       }
 
+      // Espera a “Centro y servicio” por UI o por red
       ready = await waitAppointmentScreen(page, 90000);
+
+      // Si sigue sin estar listo, intentamos “nudge” y recarga suave
       if (!ready) {
         await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-        await pressHome(page);
+        await humanNudge(page);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
+        await waitMaskGone(page, 15000);
+        // segundo intento de detectar
+        ready = await waitAppointmentScreen(page, 40000);
       }
     }
 
@@ -221,8 +254,10 @@ async function run() {
       throw new Error('No se cargó la pantalla "Centro y servicio"');
     }
 
+    // Selección y siguiente
     await selectCenterAndService(page);
 
+    // Disponibilidad
     const available = await checkAvailability(page);
     await page.screenshot({ path: "state.png", fullPage: true }).catch(() => {});
     if (available) {
@@ -235,7 +270,6 @@ async function run() {
   } catch (e) {
     console.error("Error en la ejecución:", e);
   } finally {
-    // guarda la traza
     await context.tracing.stop({ path: "traces/trace.zip" }).catch(() => {});
     await context.close();
     await browser.close();
