@@ -7,6 +7,7 @@ on:
 jobs:
   check:
     runs-on: self-hosted
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,12 +17,22 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps
+      # Windows (runner local): instala dependencias SIN --with-deps
+      - name: Install deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           npm install
-          # Instala TODOS los navegadores (incluye WebKit) en el runner:
+          npx playwright install
+
+      # Linux/macOS (por si algún día mueves el runner)
+      - name: Install deps (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          npm install
           npx playwright install --with-deps
 
+      # IMPORTANTE: ejecuta en modo "no headless" en tu PC y fuerza Chrome real
       - name: Run checker
         env:
           CENTRO_TEXT: ${{ secrets.CENTRO_TEXT }}
@@ -29,6 +40,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TIMEOUT_MS: "180000"
+          HEADLESS: "false"        # <- abre ventana del navegador en tu PC
+          BROWSER_CHANNEL: "chrome" # <- usa tu Google Chrome
         run: npm run check
 
       - name: Upload debug artifacts
@@ -37,10 +50,12 @@ jobs:
         with:
           name: gva-debug
           path: |
-            home.png
-            home.html
-            after_cta.png
-            after_cta.html
+            home*.png
+            home*.html
+            after_cta*.png
+            after_cta*.html
             after_cta_iframe.html
             state.png
+            videos/**
+            traces/trace.zip
           if-no-files-found: ignore
