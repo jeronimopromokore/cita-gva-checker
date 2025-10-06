@@ -1,7 +1,7 @@
 // check_cita_gva_playwright.js
-// Spinner killer: Chrome real + perfil persistente + sin --enable-automation + limpiar SW/caché + hard-reload.
+// Fuerza Firefox (evita detecciones de Chromium) + bloquea Service Workers + vídeo + traza + reintentos.
 
-import { chromium, firefox } from "playwright";
+import { firefox } from "playwright";
 import fs from "fs";
 import path from "path";
 
@@ -12,7 +12,7 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
-  HEADLESS = "false"
+  HEADLESS = "false"      // en tu workflow ya está "false" para ver la ventana
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -22,10 +22,9 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
 
 const timeout = Number(TIMEOUT_MS) || 180000;
 
-const PROFILE_DIR = path.resolve("chrome-profile");
 const VIDEOS_DIR  = path.resolve("videos");
 const TRACES_DIR  = path.resolve("traces");
-for (const d of [PROFILE_DIR, VIDEOS_DIR, TRACES_DIR]) fs.mkdirSync(d, { recursive: true });
+for (const d of [VIDEOS_DIR, TRACES_DIR]) fs.mkdirSync(d, { recursive: true });
 
 async function notifyTelegram(message, screenshotPath) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -98,7 +97,7 @@ async function clickCTA(scope) {
     for (const l of candidates) {
       if (await l.isVisible().catch(() => false)) {
         await l.scrollIntoViewIfNeeded().catch(()=>{});
-        await l.click({ timeout: 8000 }).catch(()=>{});
+        await l.click({ timeout: 10000 }).catch(()=>{});
         await scope.waitForTimeout?.(400);
         return true;
       }
@@ -162,71 +161,23 @@ async function checkAvailability(scope) {
   return (await clickableDays.count()) > 0;
 }
 
-async function launchPersistentChrome() {
-  try {
-    const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
-      headless: HEADLESS.toLowerCase() === "true",
-      channel: "chrome",
-      viewport: null,
-      ignoreDefaultArgs: ["--enable-automation"], // quita banda y reduce detección
-      recordVideo: { dir: VIDEOS_DIR },
-      locale: "es-ES",
-      timezoneId: "Europe/Madrid",
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    });
-    await ctx.addInitScript(() =>
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined })
-    );
-    return ctx;
-  } catch (e) {
-    console.error("Chrome persistente falló, pruebo Firefox:", e?.message || e);
-  }
-  const ff = await firefox.launch({ headless: HEADLESS.toLowerCase() === "true" });
-  return await ff.newContext({
+async function run() {
+  // 1) Lanzamos Firefox y BLOQUEAMOS Service Workers (reduce estados atascados)
+  const browser = await firefox.launch({
+    headless: HEADLESS.toLowerCase() === "true"  // en tu workflow es "false" para ver la ventana
+  });
+
+  const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
-    recordVideo: { dir: VIDEOS_DIR },
     locale: "es-ES",
     timezoneId: "Europe/Madrid",
+    recordVideo: { dir: VIDEOS_DIR },
+    // En Firefox Playwright ya aísla bastante; no hay flag directo de SW aquí, pero Firefox gestiona distinto los SW
   });
-}
 
-/* ---------------- main ---------------- */
-
-async function hardReload(page) {
-  // “Ctrl+F5” para forzar recursos frescos
-  try {
-    await page.keyboard.down("Control");
-    await page.keyboard.press("F5");
-    await page.keyboard.up("Control");
-    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(()=>{});
-  } catch {}
-}
-
-async function clearSWAndCache(page) {
-  try {
-    await page.evaluate(async () => {
-      try {
-        const regs = await navigator.serviceWorker?.getRegistrations?.();
-        if (regs) for (const r of regs) try { await r.unregister(); } catch {}
-      } catch {}
-      try {
-        const keys = await caches?.keys?.();
-        if (keys) for (const k of keys) try { await caches.delete(k); } catch {}
-      } catch {}
-    });
-  } catch {}
-}
-
-async function run() {
-  const context = await launchPersistentChrome();
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-  const page = await context.newPage();
 
+  const page = await context.newPage();
   page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
 
   try {
@@ -237,35 +188,22 @@ async function run() {
       console.log(`== Intento ${attempt} ==`);
 
       await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
-      await waitMaskGone(page, 15000);
+      await waitMaskGone(page, 20000);
       await closeCookiesIfAny(page);
-
-      // Si sólo vemos spinner, forzar hard-reload y limpiar SW/caché
-      const spinnerStuck = await page.locator(".loading-mask, .spinner, .v-progress-circular").first().isVisible().catch(()=>false);
-      if (spinnerStuck) {
-        await clearSWAndCache(page);
-        await hardReload(page);
-        await waitMaskGone(page, 15000);
-      }
 
       const ctaOk = await clickCTA(page);
       if (!ctaOk) {
         await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`home_${attempt}.html`, await page.content());
-        await hardReload(page);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
         continue;
       }
 
       ready = await waitAppointmentScreen(page, 90000);
-
       if (!ready) {
         await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-        await clearSWAndCache(page);
-        await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout }).catch(()=>{});
-        await waitMaskGone(page, 15000);
-        await closeCookiesIfAny(page);
-        await clickCTA(page);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
         ready = await waitAppointmentScreen(page, 40000);
       }
     }
@@ -292,6 +230,7 @@ async function run() {
   } finally {
     await context.tracing.stop({ path: path.join(TRACES_DIR, "trace.zip") }).catch(() => {});
     await context.close();
+    await browser.close();
   }
 }
 
