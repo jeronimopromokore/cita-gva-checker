@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// Deep-link + acordeones robustos + múltiples estrategias de click (JS puro en evaluate).
+// Deep-link + acordeones + scroll virtual + click nativo en ancestro clicable.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -11,8 +11,6 @@ const {
   APPOINTMENT_URL,
   CENTRO_TEXT,
   SERVICIO_TEXT,
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
   HEADLESS = "false",
   BROWSER_CHANNEL = "chrome",
@@ -29,7 +27,7 @@ const TRACES_DIR = path.resolve("traces");
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-/* ---------------- utilidades ---------------- */
+/* ---------- helpers genéricos ---------- */
 
 async function waitMaskGone(scope, maxMs = 45000) {
   const end = Date.now() + maxMs;
@@ -102,8 +100,9 @@ async function tryDeepLink(page) {
   return ok;
 }
 
+/* ---------- acordeones y selección robusta ---------- */
+
 async function expandAllAccordions(scope) {
-  // Abre TODOS los acordeones visibles (PrimeNG p-accordion)
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link');
   const count = await headers.count();
   console.log(`→ Detectados ${count} acordeones`);
@@ -111,74 +110,122 @@ async function expandAllAccordions(scope) {
     const h = headers.nth(i);
     try {
       await h.scrollIntoViewIfNeeded().catch(() => {});
-      // varios intentos de apertura
       let opened = false;
       for (const tryClick of [
-        () => h.click({ timeout: 1500 }),
-        () => h.click({ timeout: 1500, force: true }),
+        () => h.click({ timeout: 1200 }),
+        () => h.click({ timeout: 1200, force: true }),
         () => h.evaluate(el => el && el.click()),
       ]) {
         try { await tryClick(); opened = true; break; } catch {}
       }
-      if (opened) await scope.waitForTimeout(200);
+      if (opened) await scope.waitForTimeout(150);
     } catch {}
   }
 }
 
 async function ensurePanelOpen(scope, panelTitleRegex) {
-  // Abre específicamente el panel cuyo header contenga "Centro" o "Servicio"
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link')
     .filter({ hasText: panelTitleRegex });
-  const count = await headers.count();
-  for (let i = 0; i < count; i++) {
+  const n = await headers.count();
+  for (let i = 0; i < n; i++) {
     const h = headers.nth(i);
     try {
       await h.scrollIntoViewIfNeeded().catch(() => {});
-      // si está aria-expanded="true" lo dejamos
       const expanded = await h.getAttribute("aria-expanded").catch(() => null);
       if (expanded !== "true") {
         for (const tryClick of [
-          () => h.click({ timeout: 1500 }),
-          () => h.click({ timeout: 1500, force: true }),
+          () => h.click({ timeout: 1200 }),
+          () => h.click({ timeout: 1200, force: true }),
           () => h.evaluate(el => el && el.click()),
-        ]) {
-          try { await tryClick(); break; } catch {}
-        }
-        await scope.waitForTimeout(250);
+        ]) { try { await tryClick(); break; } catch {} }
+        await scope.waitForTimeout(200);
       }
     } catch {}
   }
 }
 
-async function robustClickText(scope, textRegex) {
-  const t = scope.locator(`text=/${textRegex.source}/${textRegex.flags}`).first();
-  await t.scrollIntoViewIfNeeded().catch(() => {});
-  // 3 estrategias en cascada
-  for (const tryClick of [
-    () => t.click({ timeout: 4000 }),
-    () => t.click({ timeout: 4000, force: true }),
-    () => t.evaluate(el => el && el.click()),
-  ]) {
-    try { await tryClick(); return true; } catch {}
-    await scope.waitForTimeout?.(150);
+/**
+ * Busca el elemento por texto (regex), hace scroll dentro del panel de contenido
+ * y hace click sobre el mejor ancestro clicable (button/a/label/li/[role=option]...).
+ */
+async function findAndClickOption(scope, panelRegex, optionRegex) {
+  // 1) ubica el panel de contenido asociado (región debajo del header)
+  const panelRegion = scope.locator(
+    '.p-accordion-content, [role="region"], .p-panel-content'
+  ).filter({ has: scope.locator(`text=/${panelRegex.source}/${panelRegex.flags}`) }).first();
+
+  // si no encuentra por “has:”, cae al primer content visible
+  const container = (await panelRegion.isVisible().catch(()=>false))
+    ? panelRegion
+    : scope.locator('.p-accordion-content:visible, [role="region"]:visible, .p-panel-content:visible').first();
+
+  // 2) scroll incremental para encontrar el texto dentro del contenedor
+  const MAX_STEPS = 20;
+  for (let step = 0; step < MAX_STEPS; step++) {
+    // Localizador del texto dentro del contenedor
+    const textNode = container.locator(`text=/${optionRegex.source}/${optionRegex.flags}`).first();
+    if (await textNode.isVisible().catch(()=>false)) {
+      // 3) intenta click directo y ancestros clicables
+      const candidates = [
+        textNode,
+        textNode.locator('xpath=ancestor-or-self::*[self::button or self::a or self::label or self::li or @role="option" or @role="radio" or @role="menuitem"][1]')
+      ];
+      for (const cand of candidates) {
+        try {
+          await cand.scrollIntoViewIfNeeded().catch(()=>{});
+          for (const tryClick of [
+            () => cand.click({ timeout: 2000 }),
+            () => cand.click({ timeout: 2000, force: true }),
+            () => cand.evaluate(el => {
+              if (!el) return;
+              const r = el.getBoundingClientRect();
+              const x = r.left + r.width/2, y = r.top + r.height/2;
+              const evt = (type) => el.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
+              evt('mouseover'); evt('mousedown'); evt('mouseup'); evt('click');
+            }),
+          ]) {
+            try { await tryClick(); return true; } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    // 4) si no es visible aún, hace scroll del contenedor
+    try {
+      const scrolled = await container.evaluate((el) => {
+        if (!el) return false;
+        const before = el.scrollTop;
+        el.scrollTop = Math.min(el.scrollTop + 300, el.scrollHeight);
+        return el.scrollTop !== before;
+      }).catch(()=>false);
+      if (!scrolled) {
+        // si no se puede scrollear más, prueba a scrollear la página
+        await scope.mouse.wheel(0, 500).catch(()=>{});
+      }
+    } catch {}
+    await scope.waitForTimeout?.(200);
   }
   return false;
 }
 
 async function selectCenterAndService(scope) {
-  // 1) abre todos y luego asegura paneles clave abiertos
   await expandAllAccordions(scope);
   await ensurePanelOpen(scope, /Centro|Centre/i);
   await ensurePanelOpen(scope, /Servicio|Servei/i);
 
-  // 2) click centro + servicio con estrategia robusta
-  const centroOK = await robustClickText(scope, new RegExp(CENTRO_TEXT, "i"));
+  // CENTRO
+  const centroOK =
+    (await findAndClickOption(scope, /Centro|Centre/i, new RegExp(CENTRO_TEXT, "i"))) ||
+    (await scope.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 2000 }).then(()=>true).catch(()=>false));
   if (!centroOK) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
 
-  const servOK = await robustClickText(scope, new RegExp(SERVICIO_TEXT, "i"));
+  // SERVICIO
+  const servOK =
+    (await findAndClickOption(scope, /Servicio|Servei/i, new RegExp(SERVICIO_TEXT, "i"))) ||
+    (await scope.locator(`text=/${SERVICIO_TEXT}/i`).first().click({ timeout: 2000 }).then(()=>true).catch(()=>false));
   if (!servOK) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
 
-  // 3) botón Siguiente
+  // Siguiente
   const nexts = [
     scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
     scope.locator('button:has-text("Siguiente")').first(),
@@ -191,12 +238,10 @@ async function selectCenterAndService(scope) {
       const v = await n.isVisible().catch(() => false);
       if (v) {
         for (const tryClick of [
-          () => n.click({ timeout: 2000 }),
-          () => n.click({ timeout: 2000, force: true }),
+          () => n.click({ timeout: 1500 }),
+          () => n.click({ timeout: 1500, force: true }),
           () => n.evaluate(el => el && el.click()),
-        ]) {
-          try { await tryClick(); clickedNext = true; break; } catch {}
-        }
+        ]) { try { await tryClick(); clickedNext = true; break; } catch {} }
       }
       if (clickedNext) break;
     } catch {}
@@ -204,16 +249,7 @@ async function selectCenterAndService(scope) {
   if (!clickedNext) throw new Error('No se pudo pulsar "Siguiente"');
 }
 
-async function checkAvailability(scope) {
-  await waitMaskGone(scope, 20000);
-  const noDays  = await scope.locator('text=/No hay días disponibles|No hi ha dies disponibles/i').first().isVisible().catch(() => false);
-  const noHours = await scope.locator('text=/No hay horas disponibles|No hi ha hores disponibles/i').first().isVisible().catch(() => false);
-  if (!noDays || !noHours) return true;
-  const clickableDays = scope.locator("button, [role='button']").filter({ hasText: /\b\d{1,2}\b/ });
-  return (await clickableDays.count()) > 0;
-}
-
-/* ---------------- main ---------------- */
+/* ---------- main ---------- */
 
 async function run() {
   const browser = await chromium.launch({
@@ -231,7 +267,6 @@ async function run() {
   });
 
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-
   const page = await context.newPage();
 
   try {
@@ -240,13 +275,12 @@ async function run() {
 
     await selectCenterAndService(page);
 
-    const available = await checkAvailability(page);
+    // Espera breve por transición de pantalla siguiente (calendario)
+    await waitMaskGone(page, 5000);
+
+    // Aquí puedes añadir el chequeo de disponibilidad si quieres continuar.
+    console.log("Centro y servicio seleccionados correctamente.");
     await page.screenshot({ path: "state.png", fullPage: true }).catch(() => {});
-    if (available) {
-      console.log(`⚠️ POSIBLE DISPONIBILIDAD de cita\nCentro: ${CENTRO_TEXT}\nServicio: ${SERVICIO_TEXT}`);
-    } else {
-      console.log(`Sin disponibilidad de cita por ahora (Centro: ${CENTRO_TEXT} · Servicio: ${SERVICIO_TEXT}).`);
-    }
   } catch (e) {
     console.error("Error en la ejecución:", e);
   } finally {
