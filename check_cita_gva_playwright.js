@@ -1,12 +1,15 @@
 // check_cita_gva_playwright.js
-// Flujo robusto para una SPA donde la URL no cambia (como en el vídeo).
-// 1) Carga la URL base
-// 2) Clic por texto en "Solicitar cita previa"
-// 3) Selecciona Centro y Servicio por texto
-// 4) "Siguiente" y verifica disponibilidad
-// 5) Telegram opcional con captura
+// Versión SPA robusta + depuración (capturas y HTML).
+// Estrategia:
+//  - Carga URL base
+//  - Clic por texto en "Solicitar cita previa" (main + iframes)
+//  - Espera múltiples "marcadores" de la pantalla de selección (Centro/Servicio/combobox/botón Siguiente)
+//  - Selecciona Centro y Servicio por texto
+//  - Pulsa Siguiente y comprueba disponibilidad
+//  - Siempre genera capturas y, si falla, guarda HTML para depurar
 
 import { chromium } from "playwright";
+import fs from "fs";
 
 const {
   GVA_URL = "https://sige.gva.es/qsige/citaprevia.justicia/#/es/home",
@@ -14,7 +17,7 @@ const {
   SERVICIO_TEXT,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  TIMEOUT_MS = "60000",
+  TIMEOUT_MS = "90000", // subimos timeout
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -22,9 +25,7 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
   process.exit(1);
 }
 
-const timeout = Number(TIMEOUT_MS) || 60000;
-
-// --- Utilidades --------------------------------------------------------------
+const timeout = Number(TIMEOUT_MS) || 90000;
 
 async function notifyTelegram(message, screenshotPath) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -33,17 +34,12 @@ async function notifyTelegram(message, screenshotPath) {
     await fetch(`${api}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, disable_web_page_preview: true }),
     });
     if (screenshotPath) {
-      const fs = await import("fs");
       const form = new FormData();
       form.set("chat_id", TELEGRAM_CHAT_ID);
-      form.set("caption", "Captura del estado actual");
+      form.set("caption", "Estado actual");
       form.set("photo", new Blob([fs.readFileSync(screenshotPath)]), "captura.png");
       await fetch(`${api}/sendPhoto`, { method: "POST", body: form });
     }
@@ -57,8 +53,8 @@ async function closeCookiesIfAny(scope) {
     const candidates = [
       scope.locator('button:has-text("Aceptar")'),
       scope.locator('text=/Aceptar todas/i'),
+      scope.locator('text=/Acceptar totes/i'),
       scope.getByRole?.("button", { name: /aceptar|acepto|consentir|aceptar todas/i }),
-      scope.locator('text=/Acceptar totes/i'), // VA
     ].filter(Boolean);
     for (const c of candidates) {
       const v = await c.isVisible().catch(() => false);
@@ -67,30 +63,109 @@ async function closeCookiesIfAny(scope) {
   } catch {}
 }
 
-async function clickByText(scope, regexp, clickTimeout = 5000) {
-  const target = scope.locator(`text=${regexp}`).first();
-  const visible = await target.isVisible().catch(() => false);
-  if (visible) {
-    await target.scrollIntoViewIfNeeded().catch(() => {});
-    await target.click({ timeout: clickTimeout }).catch(() => {});
-    return true;
-  }
-  return false;
-}
-
-async function waitAnyText(scope, regexps, waitMs = 10000) {
-  const end = Date.now() + waitMs;
-  while (Date.now() < end) {
-    for (const re of regexps) {
-      const loc = scope.locator(`text=${re}`).first();
-      if (await loc.isVisible().catch(() => false)) return true;
+async function clickCTA(page) {
+  const ctaRegexes = [/Solicitar cita previa/i, /Cita previa/i];
+  // 1) main
+  for (const re of ctaRegexes) {
+    const locs = [
+      page.getByRole("button", { name: re }),
+      page.locator(`button:has-text("${re.source ? re.source.replace(/\\//g,"") : re}")`).first(),
+      page.locator(`a:has-text("${re.source ? re.source.replace(/\\//g,"") : re}")`).first(),
+      page.locator(`text=/${re.source}/${re.flags}`).first(),
+    ];
+    for (const l of locs) {
+      const v = await l.isVisible().catch(() => false);
+      if (v) { await l.click({ timeout: 6000 }).catch(()=>{}); return true; }
     }
-    await new Promise(r => setTimeout(r, 300));
+  }
+  // 2) iframes
+  for (const frame of page.frames()) {
+    await closeCookiesIfAny(frame);
+    for (const re of ctaRegexes) {
+      const locs = [
+        frame.getByRole("button", { name: re }),
+        frame.locator(`button:has-text("${re.source ? re.source.replace(/\\//g,"") : re}")`).first(),
+        frame.locator(`a:has-text("${re.source ? re.source.replace(/\\//g,"") : re}")`).first(),
+        frame.locator(`text=/${re.source}/${re.flags}`).first(),
+      ];
+      for (const l of locs) {
+        const v = await l.isVisible().catch(() => false);
+        if (v) { await l.click({ timeout: 6000 }).catch(()=>{}); return true; }
+      }
+    }
   }
   return false;
 }
 
-// --- Lógica principal --------------------------------------------------------
+async function waitForAppointmentScreen(page) {
+  // Espera cualquiera de estos marcadores de UI típicos de “Centro y servicio”
+  const probes = [
+    'text=/Centro y servicio/i',
+    'text=/Seleccione centro/i',
+    'text=/Seleccione servicio/i',
+    'text=/Centro\\s*$/i',
+    'text=/Servicio\\s*$/i',
+    'button:has-text("Siguiente")',
+    '[role="combobox"]',
+    'select',
+    // variantes valenciano
+    'text=/Centre i servei/i',
+    'text=/Seleccione centre/i',
+    'text=/Seleccione servei/i',
+    'button:has-text("Següent")',
+  ];
+  const end = Date.now() + 25000;
+  while (Date.now() < end) {
+    for (const p of probes) {
+      const loc = page.locator(p).first();
+      if (await loc.isVisible().catch(()=>false)) return true;
+    }
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
+async function selectCenterAndService(page) {
+  // Intenta abrir acordeones si existen
+  for (const title of [/^\s*Centro\s*$/i, /^\s*Servicio\s*$/i, /^\s*Centre\s*$/i, /^\s*Servei\s*$/i]) {
+    const acc = page.locator(`text=/${title.source}/${title.flags}`).first();
+    if (await acc.isVisible().catch(()=>false)) { await acc.click({ timeout: 3000 }).catch(()=>{}); }
+  }
+
+  // Selección por texto (no exacto, case-insensitive)
+  const centro = page.locator(`text=/${CENTRO_TEXT}/i`).first();
+  await centro.scrollIntoViewIfNeeded({ timeout }).catch(()=>{});
+  await centro.click({ timeout });
+
+  const servicio = page.locator(`text=/${SERVICIO_TEXT}/i`).first();
+  await servicio.scrollIntoViewIfNeeded({ timeout }).catch(()=>{});
+  await servicio.click({ timeout });
+
+  // Botón "Siguiente" (ES/VA)
+  const nexts = [
+    page.getByRole("button", { name: /Siguiente|Següent/i }).first(),
+    page.locator('button:has-text("Siguiente")').first(),
+    page.locator('button:has-text("Següent")').first(),
+    page.locator('text=/Siguiente|Següent/i').first(),
+  ];
+  for (const n of nexts) {
+    const v = await n.isVisible().catch(()=>false);
+    if (v) { await n.click({ timeout }); return; }
+  }
+  throw new Error('No se pudo pulsar "Siguiente"');
+}
+
+async function checkAvailability(page) {
+  await page.waitForLoadState("networkidle", { timeout }).catch(()=>{});
+  await page.waitForTimeout(1500);
+  const noDays = await page.locator('text=/No hay días disponibles|No hi ha dies disponibles/i').first().isVisible().catch(()=>false);
+  const noHours = await page.locator('text=/No hay horas disponibles|No hi ha hores disponibles/i').first().isVisible().catch(()=>false);
+  if (!noDays || !noHours) return true;
+
+  const clickableDays = page.locator("button, [role='button']").filter({ hasText: /\b\d{1,2}\b/ });
+  const count = await clickableDays.count();
+  return count > 0;
+}
 
 async function run() {
   const browser = await chromium.launch({ headless: true });
@@ -100,115 +175,40 @@ async function run() {
   });
   const page = await context.newPage();
 
-  let availabilityFound = false;
-
   try {
-    // 1) Abrir SPA base
+    // 1) Home
     await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
-    await page.waitForLoadState("networkidle", { timeout }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout }).catch(()=>{});
     await closeCookiesIfAny(page);
+    await page.waitForTimeout(1200);
 
-    // 2) Esperar el CTA por texto y hacer clic
-    const ctaTexts = [/Solicitar cita previa/i, /Cita previa/i];
-    const seenHome = await waitAnyText(page, ctaTexts, 20000);
-    if (!seenHome) {
-      await page.screenshot({ path: "home.png", fullPage: true }).catch(() => {});
-      throw new Error('No aparece el texto "Solicitar cita previa" en el home');
-    }
-
-    let ctaClicked = false;
-    // main
-    for (const re of ctaTexts) {
-      if (await clickByText(page, `/${re.source}/${re.flags}`, 7000)) { ctaClicked = true; break; }
-    }
-    // frames (por si el CTA está dentro de un iframe)
-    if (!ctaClicked) {
-      for (const f of page.frames()) {
-        await closeCookiesIfAny(f);
-        for (const re of ctaTexts) {
-          if (await clickByText(f, `/${re.source}/${re.flags}`, 7000)) { ctaClicked = true; break; }
-        }
-        if (ctaClicked) break;
-      }
-    }
-    if (!ctaClicked) {
-      await page.screenshot({ path: "home.png", fullPage: true }).catch(() => {});
+    // 2) Clic CTA
+    const ctaOk = await clickCTA(page);
+    if (!ctaOk) {
+      await page.screenshot({ path: "home.png", fullPage: true }).catch(()=>{});
+      fs.writeFileSync("home.html", await page.content());
       throw new Error('No se pudo clicar "Solicitar cita previa"');
     }
 
-    // 3) Esperar pantalla de "Centro y servicio" (texto genérico)
-    const centreTexts = [
-      /Centro y servicio/i,
-      /Centro\s*$/i,
-      /Servicio\s*$/i,
-      /Seleccione centro/i,
-      /Seleccione servicio/i,
-      /Siguiente/i,
-    ];
-    const onCenter = await waitAnyText(page, centreTexts, 15000);
-    if (!onCenter) {
-      await page.screenshot({ path: "after_cta.png", fullPage: true }).catch(() => {});
+    // 3) Esperar pantalla "Centro y servicio"
+    const appointmentOk = await waitForAppointmentScreen(page);
+    if (!appointmentOk) {
+      await page.screenshot({ path: "after_cta.png", fullPage: true }).catch(()=>{});
+      fs.writeFileSync("after_cta.html", await page.content());
       throw new Error('No se cargó la pantalla "Centro y servicio"');
     }
 
-    // Abrir acordeones si están colapsados (si existen)
-    for (const re of [/^\s*Centro\s*$/i, /^\s*Servicio\s*$/i]) {
-      const loc = page.locator(`text=/${re.source}/${re.flags}`).first();
-      if (await loc.isVisible().catch(() => false)) {
-        await loc.click({ timeout: 3000 }).catch(() => {}); // harmless si ya está abierto
-      }
-    }
+    // 4) Selección y Siguiente
+    await selectCenterAndService(page);
 
-    // Seleccionar centro y servicio por texto parcial
-    const centro = page.locator(`text=/${CENTRO_TEXT}/i`).first();
-    await centro.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
-    await centro.click({ timeout });
+    // 5) Disponibilidad
+    const available = await checkAvailability(page);
+    await page.screenshot({ path: "state.png", fullPage: true }).catch(()=>{});
 
-    const servicio = page.locator(`text=/${SERVICIO_TEXT}/i`).first();
-    await servicio.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
-    await servicio.click({ timeout });
-
-    // 4) Siguiente
-    const nextOptions = [
-      page.getByRole("button", { name: /Siguiente/i }),
-      page.locator('button:has-text("Siguiente")').first(),
-      page.locator('text=/Siguiente/i').first(),
-    ];
-    let nextClicked = false;
-    for (const n of nextOptions) {
-      const v = await n.isVisible().catch(() => false);
-      if (v) { await n.click({ timeout }).catch(() => {}); nextClicked = true; break; }
-    }
-    if (!nextClicked) {
-      await page.screenshot({ path: "center_service.png", fullPage: true }).catch(() => {});
-      throw new Error('No se pudo pulsar "Siguiente"');
-    }
-
-    // 5) Verificar disponibilidad (SPA: esperar render)
-    await page.waitForLoadState("networkidle", { timeout }).catch(() => {});
-    await page.waitForTimeout(1500);
-
-    const noDaysLoc = page.locator('text=/No hay días disponibles/i').first();
-    const noHoursLoc = page.locator('text=/No hay horas disponibles/i').first();
-    const noDays = await noDaysLoc.isVisible().catch(() => false);
-    const noHours = await noHoursLoc.isVisible().catch(() => false);
-
-    if (!noDays || !noHours) {
-      availabilityFound = true;
-    } else {
-      // heurística: ¿aparecen botones con dígitos (días)?
-      const clickableDays = page.locator("button, [role='button']").filter({ hasText: /\b\d{1,2}\b/ });
-      const count = await clickableDays.count();
-      if (count > 0) availabilityFound = true;
-    }
-
-    const shot = "state.png";
-    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-
-    if (availabilityFound) {
+    if (available) {
       const msg = `⚠️ POSIBLE DISPONIBILIDAD de cita\nCentro: ${CENTRO_TEXT}\nServicio: ${SERVICIO_TEXT}`;
       console.log(msg);
-      await notifyTelegram(msg, shot);
+      await notifyTelegram(msg, "state.png");
     } else {
       console.log(`Sin disponibilidad de cita por ahora (Centro: ${CENTRO_TEXT} · Servicio: ${SERVICIO_TEXT}).`);
     }
