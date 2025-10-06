@@ -18,8 +18,8 @@ jobs:
 
       - name: Install deps
         run: |
-          npm ci || npm install
-          npx playwright install --with-deps chromium
+        npm install
+        npx playwright install --with-deps chromium
 
       - name: Run checker
         env:
