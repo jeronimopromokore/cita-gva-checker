@@ -27,5 +27,18 @@ jobs:
           SERVICIO_TEXT: ${{ secrets.SERVICIO_TEXT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TIMEOUT_MS: "60000"
+          TIMEOUT_MS: "90000"
         run: npm run check
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gva-debug
+          path: |
+            home.png
+            home.html
+            after_cta.png
+            after_cta.html
+            state.png
+          if-no-files-found: ignore
