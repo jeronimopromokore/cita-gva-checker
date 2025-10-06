@@ -19,7 +19,8 @@ jobs:
       - name: Install deps
         run: |
           npm install
-          npx playwright install --with-deps chromium
+          # Instala TODOS los navegadores (incluye WebKit) en el runner:
+          npx playwright install --with-deps
 
       - name: Run checker
         env:
@@ -27,7 +28,7 @@ jobs:
           SERVICIO_TEXT: ${{ secrets.SERVICIO_TEXT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TIMEOUT_MS: "90000"
+          TIMEOUT_MS: "180000"
         run: npm run check
 
       - name: Upload debug artifacts
@@ -40,5 +41,6 @@ jobs:
             home.html
             after_cta.png
             after_cta.html
+            after_cta_iframe.html
             state.png
           if-no-files-found: ignore
