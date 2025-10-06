@@ -1,18 +1,23 @@
 // check_cita_gva_playwright.js
-// Fuerza Firefox (evita detecciones de Chromium) + bloquea Service Workers + vídeo + traza + reintentos.
+// 1º intenta deep-link: /es/appointment?uuid=...  → si carga, sigue.
+// Si no, cae al flujo antiguo desde /es/home.
+// Graba vídeo y traza para depurar.
 
-import { firefox } from "playwright";
+import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 
 const {
-  GVA_URL = "https://sige.gva.es/qsige/citaprevia.justicia/#/es/home",
+  GVA_BASE = "https://sige.gva.es/qsige/citaprevia.justicia",
+  APPOINTMENT_UUID,                 // <- añade este secret si puedes
+  APPOINTMENT_URL,                  // <- o pásalo entero si prefieres
   CENTRO_TEXT,
   SERVICIO_TEXT,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
-  HEADLESS = "false"      // en tu workflow ya está "false" para ver la ventana
+  HEADLESS = "false",
+  BROWSER_CHANNEL = "chrome"        // usa tu Chrome si está en el runner
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -21,10 +26,12 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
 }
 
 const timeout = Number(TIMEOUT_MS) || 180000;
+const VIDEOS_DIR = path.resolve("videos");
+const TRACES_DIR = path.resolve("traces");
+fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-const VIDEOS_DIR  = path.resolve("videos");
-const TRACES_DIR  = path.resolve("traces");
-for (const d of [VIDEOS_DIR, TRACES_DIR]) fs.mkdirSync(d, { recursive: true });
+/* ---------- helpers ---------- */
 
 async function notifyTelegram(message, screenshotPath) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -45,6 +52,28 @@ async function notifyTelegram(message, screenshotPath) {
   } catch {}
 }
 
+async function waitMaskGone(scope, maxMs = 45000) {
+  const end = Date.now() + maxMs;
+  const masks = [
+    scope.locator(".loading-mask"),
+    scope.locator('[aria-busy="true"]'),
+    scope.locator(".v-progress-circular, .spinner, .loading"),
+  ];
+  while (Date.now() < end) {
+    let anyVisible = false;
+    for (const m of masks) {
+      if (await m.first().isVisible().catch(() => false)) { anyVisible = true; break; }
+    }
+    if (!anyVisible) {
+      await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(() => {});
+      await scope.waitForTimeout?.(400);
+      return true;
+    }
+    await scope.waitForTimeout?.(300);
+  }
+  return false;
+}
+
 async function closeCookiesIfAny(scope) {
   try {
     const cands = [
@@ -60,32 +89,43 @@ async function closeCookiesIfAny(scope) {
   } catch {}
 }
 
-async function waitMaskGone(scope, maxMs = 45000) {
-  const end = Date.now() + maxMs;
-  const masks = [
-    scope.locator(".loading-mask"),
-    scope.locator('[aria-busy="true"]'),
-    scope.locator('.v-progress-circular, .spinner, .loading'),
+async function onAppointmentScreen(scope, totalWaitMs = 60000) {
+  const end = Date.now() + totalWaitMs;
+  const probes = [
+    /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
+    /Siguiente|Següent/i, /Centre i servei/i, /Seleccione centre|servei/i
   ];
   while (Date.now() < end) {
-    let anyVisible = false;
-    for (const m of masks) {
-      if (await m.first().isVisible().catch(() => false)) { anyVisible = true; break; }
+    const gone = await waitMaskGone(scope, 4000);
+    for (const re of probes) {
+      const el = scope.locator(`text=/${re.source}/${re.flags}`).first();
+      if (await el.isVisible().catch(() => false)) return true;
     }
-    if (!anyVisible) {
-      if (scope.waitForLoadState) {
-        await scope.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-      }
-      await scope.waitForTimeout?.(600);
-      return true;
-    }
-    await scope.waitForTimeout?.(350);
+    if (!gone) await scope.waitForTimeout?.(400);
   }
   return false;
 }
 
+async function tryDeepLink(page) {
+  const url = APPOINTMENT_URL
+    ? APPOINTMENT_URL
+    : (APPOINTMENT_UUID ? `${GVA_BASE}/#/es/appointment?uuid=${APPOINTMENT_UUID}` : null);
+
+  if (!url) return false;
+
+  console.log("→ Intentando deep-link:", url);
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+  await closeCookiesIfAny(page);
+  const ok = await onAppointmentScreen(page, 90000);
+  if (!ok) {
+    await page.screenshot({ path: "after_deeplink.png", fullPage: true }).catch(() => {});
+    fs.writeFileSync("after_deeplink.html", await page.content());
+  }
+  return ok;
+}
+
 async function clickCTA(scope) {
-  const candidates = [
+  const locs = [
     scope.getByText?.(/Solicitar cita previa/i).first(),
     scope.locator?.('button:has-text("Solicitar cita previa")').first(),
     scope.locator?.('a:has-text("Solicitar cita previa")').first(),
@@ -94,37 +134,15 @@ async function clickCTA(scope) {
     scope.locator?.('a:has-text("Cita previa")').first(),
   ].filter(Boolean);
   for (let pass = 0; pass < 2; pass++) {
-    for (const l of candidates) {
+    for (const l of locs) {
       if (await l.isVisible().catch(() => false)) {
         await l.scrollIntoViewIfNeeded().catch(()=>{});
         await l.click({ timeout: 10000 }).catch(()=>{});
-        await scope.waitForTimeout?.(400);
+        await scope.waitForTimeout?.(300);
         return true;
       }
     }
-    await scope.waitForTimeout?.(400);
-  }
-  return false;
-}
-
-async function waitAppointmentScreen(scope, totalWaitMs = 90000) {
-  const end = Date.now() + totalWaitMs;
-  const ui = [
-    /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
-    /Siguiente|Següent/i, /Centre i servei/i, /Seleccione centre|servei/i
-  ];
-  while (Date.now() < end) {
-    const gone = await waitMaskGone(scope, 5000);
-    for (const re of ui) {
-      const loc = scope.locator?.(`text=/${re.source}/${re.flags}`).first();
-      if (loc && await loc.isVisible().catch(() => false)) return true;
-    }
-    const ok = await scope.waitForResponse?.(
-      res => /cita|appointment|slot|centro|servicio|agenda|disponible/i.test(res.url()) && res.status() < 500,
-      { timeout: 2500 }
-    ).then(()=>true).catch(()=>false);
-    if (ok) return true;
-    if (!gone) await scope.waitForTimeout?.(600);
+    await scope.waitForTimeout?.(300);
   }
   return false;
 }
@@ -153,7 +171,7 @@ async function selectCenterAndService(scope) {
 }
 
 async function checkAvailability(scope) {
-  await waitMaskGone(scope, 25000);
+  await waitMaskGone(scope, 20000);
   const noDays  = await scope.locator('text=/No hay días disponibles|No hi ha dies disponibles/i').first().isVisible().catch(() => false);
   const noHours = await scope.locator('text=/No hay horas disponibles|No hi ha hores disponibles/i').first().isVisible().catch(() => false);
   if (!noDays || !noHours) return true;
@@ -161,10 +179,13 @@ async function checkAvailability(scope) {
   return (await clickableDays.count()) > 0;
 }
 
+/* ---------- main ---------- */
+
 async function run() {
-  // 1) Lanzamos Firefox y BLOQUEAMOS Service Workers (reduce estados atascados)
-  const browser = await firefox.launch({
-    headless: HEADLESS.toLowerCase() === "true"  // en tu workflow es "false" para ver la ventana
+  const browser = await chromium.launch({
+    headless: HEADLESS.toLowerCase() === "true",
+    channel: BROWSER_CHANNEL || undefined,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
   const context = await browser.newContext({
@@ -172,7 +193,7 @@ async function run() {
     locale: "es-ES",
     timezoneId: "Europe/Madrid",
     recordVideo: { dir: VIDEOS_DIR },
-    // En Firefox Playwright ya aísla bastante; no hay flag directo de SW aquí, pero Firefox gestiona distinto los SW
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
 
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
@@ -181,30 +202,30 @@ async function run() {
   page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
 
   try {
-    let attempt = 0, ready = false;
+    // 1) PRIMER INTENTO: deep-link a appointment
+    let ready = await tryDeepLink(page);
 
-    while (attempt < 3 && !ready) {
-      attempt++;
-      console.log(`== Intento ${attempt} ==`);
+    // 2) FALLBACK: flujo antiguo desde home (por si el uuid caduca o cambia)
+    if (!ready) {
+      console.log("→ Deep-link no mostró 'Centro y servicio'. Probando desde /es/home");
+      const HOME_URL = `${GVA_BASE}/#/es/home`;
+      for (let attempt = 1; attempt <= 2 && !ready; attempt++) {
+        console.log(`== Home intento ${attempt} ==`);
+        await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout });
+        await waitMaskGone(page, 15000);
+        await closeCookiesIfAny(page);
 
-      await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
-      await waitMaskGone(page, 20000);
-      await closeCookiesIfAny(page);
-
-      const ctaOk = await clickCTA(page);
-      if (!ctaOk) {
-        await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
-        fs.writeFileSync(`home_${attempt}.html`, await page.content());
-        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
-        continue;
-      }
-
-      ready = await waitAppointmentScreen(page, 90000);
-      if (!ready) {
-        await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
-        fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
-        ready = await waitAppointmentScreen(page, 40000);
+        const cta = await clickCTA(page);
+        if (!cta) {
+          await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
+          fs.writeFileSync(`home_${attempt}.html`, await page.content());
+          continue;
+        }
+        ready = await onAppointmentScreen(page, 60000);
+        if (!ready) {
+          await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
+          fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
+        }
       }
     }
 
@@ -214,6 +235,7 @@ async function run() {
       throw new Error('No se cargó la pantalla "Centro y servicio"');
     }
 
+    // 3) Flujo normal
     await selectCenterAndService(page);
 
     const available = await checkAvailability(page);
