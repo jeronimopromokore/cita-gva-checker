@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// Deep-link + acordeones robustos + múltiples estrategias de click.
+// Deep-link + acordeones robustos + múltiples estrategias de click (JS puro en evaluate).
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -116,7 +116,7 @@ async function expandAllAccordions(scope) {
       for (const tryClick of [
         () => h.click({ timeout: 1500 }),
         () => h.click({ timeout: 1500, force: true }),
-        () => h.evaluate(node => (node as HTMLElement).click()),
+        () => h.evaluate(el => el && el.click()),
       ]) {
         try { await tryClick(); opened = true; break; } catch {}
       }
@@ -140,7 +140,7 @@ async function ensurePanelOpen(scope, panelTitleRegex) {
         for (const tryClick of [
           () => h.click({ timeout: 1500 }),
           () => h.click({ timeout: 1500, force: true }),
-          () => h.evaluate(node => (node as HTMLElement).click()),
+          () => h.evaluate(el => el && el.click()),
         ]) {
           try { await tryClick(); break; } catch {}
         }
@@ -157,7 +157,7 @@ async function robustClickText(scope, textRegex) {
   for (const tryClick of [
     () => t.click({ timeout: 4000 }),
     () => t.click({ timeout: 4000, force: true }),
-    () => t.evaluate(node => (node as HTMLElement).click()),
+    () => t.evaluate(el => el && el.click()),
   ]) {
     try { await tryClick(); return true; } catch {}
     await scope.waitForTimeout?.(150);
@@ -193,7 +193,7 @@ async function selectCenterAndService(scope) {
         for (const tryClick of [
           () => n.click({ timeout: 2000 }),
           () => n.click({ timeout: 2000, force: true }),
-          () => n.evaluate(node => (node as HTMLElement).click()),
+          () => n.evaluate(el => el && el.click()),
         ]) {
           try { await tryClick(); clickedNext = true; break; } catch {}
         }
