@@ -1,0 +1,12 @@
+{
+  "name": "cita-gva-checker",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "check": "node check_cita_gva_playwright.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
