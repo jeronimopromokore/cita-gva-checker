@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// Deep-link + acordeones + selección robusta de SERVICIO (buscador, scroll virtual, click por bbox).
+// Deep-link + acordeones + selección de SERVICIO por similitud + volcados de opciones.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -29,6 +29,27 @@ fs.mkdirSync(TRACES_DIR, { recursive: true });
 
 /* ---------- utilidades ---------- */
 
+const norm = (s) =>
+  (s || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+function similarityScore(targetNorm, optionNorm) {
+  // puntuación simple: presencia de tokens + contains global
+  const tks = targetNorm.split(/\s+/).filter(Boolean);
+  let score = 0;
+  if (optionNorm.includes(targetNorm)) score += 5;
+  for (const tk of tks) if (tk.length > 2 && optionNorm.includes(tk)) score += 1;
+  // pequeño bonus por longitud parecida
+  const lenDiff = Math.abs(optionNorm.length - targetNorm.length);
+  if (lenDiff <= 5) score += 1;
+  return score;
+}
+
 async function waitMaskGone(scope, maxMs = 45000) {
   const end = Date.now() + maxMs;
   const masks = [
@@ -43,7 +64,7 @@ async function waitMaskGone(scope, maxMs = 45000) {
     }
     if (!anyVisible) {
       await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(() => {});
-      await scope.waitForTimeout?.(250);
+      await scope.waitForTimeout?.(200);
       return true;
     }
     await scope.waitForTimeout?.(200);
@@ -110,15 +131,14 @@ async function expandAllAccordions(scope) {
     const h = headers.nth(i);
     try {
       await h.scrollIntoViewIfNeeded().catch(() => {});
-      // intenta abrir si no está expandido
       const expanded = await h.getAttribute("aria-expanded").catch(() => null);
       if (expanded !== "true") {
         for (const tryClick of [
-          () => h.click({ timeout: 1200 }),
-          () => h.click({ timeout: 1200, force: true }),
+          () => h.click({ timeout: 1000 }),
+          () => h.click({ timeout: 1000, force: true }),
           () => h.evaluate(el => el && el.click()),
         ]) { try { await tryClick(); break; } catch {} }
-        await scope.waitForTimeout(150);
+        await scope.waitForTimeout(120);
       }
     } catch {}
   }
@@ -135,126 +155,162 @@ async function ensurePanelOpen(scope, titleRe) {
       const expanded = await h.getAttribute("aria-expanded").catch(() => null);
       if (expanded !== "true") {
         for (const tryClick of [
-          () => h.click({ timeout: 1200 }),
-          () => h.click({ timeout: 1200, force: true }),
+          () => h.click({ timeout: 1000 }),
+          () => h.click({ timeout: 1000, force: true }),
           () => h.evaluate(el => el && el.click()),
         ]) { try { await tryClick(); break; } catch {} }
-        await scope.waitForTimeout(150);
+        await scope.waitForTimeout(120);
       }
     } catch {}
   }
 }
 
-/* ---------- selección dentro del panel ---------- */
-
 function panelContent(scope, titleRe) {
-  // Encuentra el tab por título y luego su contenido asociado más cercano
   const tab = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link').filter({ hasText: titleRe }).first();
   const container = tab.locator('xpath=following::*[contains(@class,"p-accordion-content") or @role="region" or contains(@class,"p-panel-content")][1]');
   return container;
 }
 
-async function tryServiceSearch(container, text) {
-  // Intenta escribir en inputs dentro del panel (PrimeNG: autocomplete / dropdown)
-  const inputs = container.locator('input[role="combobox"], input[type="search"], input[type="text"], .p-inputtext input, .p-autocomplete input, .p-dropdown input').filter({ hasNot: container.locator('[type="hidden"]') });
-  const k = await inputs.count();
-  for (let i = 0; i < k; i++) {
-    const inp = inputs.nth(i);
+/* ---------- extracción y selección por similitud ---------- */
+
+async function listOptionsIn(container) {
+  // Diferentes selectores típicos de PrimeNG
+  const selectors = [
+    'li', 'label', 'button', 'a',
+    '[role="option"]', '[role="radio"]', '[role="menuitem"]', '[role="treeitem"]',
+    '.p-dropdown-item', '.p-autocomplete-item', '.p-select-list-item', '.p-radiobutton-box + label'
+  ];
+  const texts = new Set();
+  for (const sel of selectors) {
+    const items = container.locator(sel);
+    const n = await items.count();
+    for (let i = 0; i < n; i++) {
+      const t = norm(await items.nth(i).innerText().catch(() => ""));
+      if (t) texts.add(t);
+    }
+  }
+  const list = Array.from(texts);
+  // dump para depurar
+  try { fs.writeFileSync("services_found.txt", list.join("\n"), "utf8"); } catch {}
+  return list;
+}
+
+async function chooseBestOption(container, targetText) {
+  const target = norm(targetText);
+  // 1) intenta inputs de búsqueda
+  const inputs = container.locator('input[role="combobox"], input[type="search"], input[type="text"], .p-inputtext input, .p-autocomplete input, .p-dropdown-filter');
+  if (await inputs.count() > 0) {
+    const inp = inputs.first();
     try {
       await inp.scrollIntoViewIfNeeded().catch(()=>{});
-      await inp.fill(""); await inp.type(text, { delay: 30 });
-      await container.waitForTimeout(400);
-      // Opciones emergentes habituales de PrimeNG
-      const popupOptions = [
-        container.getByRole("option", { name: new RegExp(text, "i") }),
-        container.locator('.p-autocomplete-panel .p-autocomplete-items .p-autocomplete-item').filter({ hasText: new RegExp(text, "i") }),
-        container.locator('.p-dropdown-items .p-dropdown-item').filter({ hasText: new RegExp(text, "i") }),
-      ];
-      for (const pop of popupOptions) {
-        const vis = await pop.first().isVisible().catch(()=>false);
-        if (vis) {
-          for (const tryClick of [
-            () => pop.first().click({ timeout: 1500 }),
-            () => pop.first().click({ timeout: 1500, force: true }),
-            () => pop.first().evaluate(el => el && el.click()),
-          ]) { try { await tryClick(); return true; } catch {} }
-        }
+      await inp.fill("");
+      await inp.type(targetText, { delay: 25 });
+      await container.waitForTimeout(600);
+      // intenta seleccionar la primera opción visible
+      const popup = container.locator('[role="option"], .p-autocomplete-item, .p-dropdown-item').filter({ hasText: new RegExp(targetText, "i") }).first();
+      if (await popup.isVisible().catch(()=>false)) {
+        for (const clickTry of [
+          () => popup.click({ timeout: 1500 }),
+          () => popup.click({ timeout: 1500, force: true }),
+          () => popup.evaluate(el => el && el.click()),
+        ]) { try { await clickTry(); return true; } catch {} }
+      } else {
+        // alternativo: Enter
+        await inp.press("Enter").catch(()=>{});
+        await container.waitForTimeout(400);
       }
     } catch {}
   }
-  return false;
-}
 
-async function scrollAndClickOption(container, text) {
-  // Busca elementos clicables por múltiples roles/selectores, con scroll incremental
-  const re = new RegExp(text, "i");
+  // 2) lista completa con scroll + similitud
   const MAX_STEPS = 30;
+  let bestLoc = null, bestScore = -1, bestText = "";
+
   for (let step = 0; step < MAX_STEPS; step++) {
-    const candidates = [
-      container.getByRole("option", { name: re }),
-      container.getByRole("radio", { name: re }),
-      container.locator('li, label, button, a, [role="menuitem"], [role="treeitem"]').filter({ hasText: re }),
-      container.locator(`text=/${re.source}/${re.flags}`),
-    ];
-    for (const cand of candidates) {
-      const el = cand.first();
-      if (await el.isVisible().catch(()=>false)) {
-        // 1) click normal / force
-        for (const tryClick of [
-          () => el.click({ timeout: 1500 }),
-          () => el.click({ timeout: 1500, force: true }),
-        ]) { try { await tryClick(); return true; } catch {} }
-        // 2) click nativo por bbox si aún intercepta algo
-        try {
-          const box = await el.boundingBox();
-          if (box) {
-            await container.page().mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-            await container.page().mouse.down(); await container.page().mouse.up();
-            return true;
-          }
-        } catch {}
+    const options = await listOptionsIn(container);
+    for (const optText of options) {
+      const score = similarityScore(target, optText);
+      if (score > bestScore) {
+        bestScore = score;
+        bestText = optText;
       }
     }
-    // scroll del contenedor; si no se mueve, scroll global
+    if (bestScore >= 2) {
+      // obtiene locator del mejor candidato por texto
+      const rx = new RegExp(bestText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      bestLoc = container.locator(`[role="option"] >> text=/${rx.source}/${rx.flags}`)
+        .first()
+        .or(container.locator(`.p-dropdown-item:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(container.locator(`.p-autocomplete-item:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(container.locator(`li:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(container.locator(`label:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(container.locator(`button:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(container.locator(`a:has-text(/${rx.source}/${rx.flags})`).first());
+      if (bestLoc) break;
+    }
+
+    // scroll si aún no hay buen match
     const scrolled = await container.evaluate((node) => {
       if (!node) return false;
       const el = node;
       const before = el.scrollTop;
-      el.scrollTop = Math.min(el.scrollTop + 350, el.scrollHeight);
+      el.scrollTop = Math.min(el.scrollTop + 400, el.scrollHeight);
       return el.scrollTop !== before;
     }).catch(()=>false);
     if (!scrolled) { await container.page().mouse.wheel(0, 600).catch(()=>{}); }
     await container.page().waitForTimeout(180);
   }
+
+  if (!bestLoc) return false;
+
+  // 3) clic del candidato
+  try {
+    await bestLoc.scrollIntoViewIfNeeded().catch(()=>{});
+    for (const clickTry of [
+      () => bestLoc.click({ timeout: 1500 }),
+      () => bestLoc.click({ timeout: 1500, force: true }),
+      () => bestLoc.evaluate(el => el && el.click()),
+      async () => {
+        const box = await bestLoc.boundingBox();
+        if (box) {
+          await container.page().mouse.move(box.x + box.width/2, box.y + box.height/2);
+          await container.page().mouse.down(); await container.page().mouse.up();
+        } else {
+          throw new Error("no-bbox");
+        }
+      },
+    ]) { try { await clickTry(); return true; } catch {} }
+  } catch {}
   return false;
 }
+
+/* ---------- flujo de selección ---------- */
 
 async function selectCenterAndService(scope) {
   await expandAllAccordions(scope);
   await ensurePanelOpen(scope, /Centro|Centre/i);
   await ensurePanelOpen(scope, /Servicio|Servei/i);
 
-  // CENTRO (similar al servicio, pero suele ser más sencillo)
+  // CENTRO
   {
     const cont = panelContent(scope, /Centro|Centre/i);
     const ok =
-      (await scrollAndClickOption(cont, CENTRO_TEXT)) ||
+      (await chooseBestOption(cont, CENTRO_TEXT)) ||
       (await scope.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
     if (!ok) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
   }
 
-  // SERVICIO: primero intenta buscador, luego scroll + múltiples selectores
+  // SERVICIO (con dump de opciones)
   {
     const cont = panelContent(scope, /Servicio|Servei/i);
-    // guarda HTML del panel para depuración si falla
     try { fs.writeFileSync("service_panel.html", await cont.innerHTML()); } catch {}
     const ok =
-      (await tryServiceSearch(cont, SERVICIO_TEXT)) ||
-      (await scrollAndClickOption(cont, SERVICIO_TEXT));
+      (await chooseBestOption(cont, SERVICIO_TEXT)) ||
+      (await scope.locator(`text=/${SERVICIO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
     if (!ok) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
   }
 
-  // Botón Siguiente
+  // Siguiente
   const nexts = [
     scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
     scope.locator('button:has-text("Siguiente")').first(),
