@@ -240,4 +240,12 @@ async function run() {
     } else {
       console.log(`Sin disponibilidad de cita por ahora (Centro: ${CENTRO_TEXT} · Servicio: ${SERVICIO_TEXT}).`);
     }
-  } catch (
+  } catch (e) {
+    console.error("Error en la ejecución:", e);
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+run();
