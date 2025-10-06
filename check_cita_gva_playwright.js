@@ -1,7 +1,8 @@
 // check_cita_gva_playwright.js
-// Versión SPA con WebKit (Safari) para evitar bloqueos de render en CI.
+// Ejecuta en runner self-hosted usando CHROME real (channel) y con "stealth" básico.
+// Graba VIDEO y TRACING para depurar si la SPA se queda cargando.
 
-import { webkit } from "playwright";
+import { chromium } from "playwright";
 import fs from "fs";
 
 const {
@@ -11,6 +12,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
+  HEADLESS = "true",
+  BROWSER_CHANNEL = "", // "chrome" para usar Google Chrome si existe
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -52,12 +55,6 @@ async function closeCookiesIfAny(scope) {
       if (v) { await c.first().click({ timeout: 3000 }).catch(() => {}); break; }
     }
   } catch {}
-}
-
-async function forceSpanish(scope) {
-  const esBtn = scope.locator('text=/^\\s*ES\\s*$/').first();
-  const visible = await esBtn.isVisible().catch(() => false);
-  if (visible) { await esBtn.click({ timeout: 4000 }).catch(() => {}); await scope.waitForTimeout(500); }
 }
 
 async function waitMaskGone(scope, maxMs = 45000) {
@@ -159,19 +156,38 @@ async function checkAvailability(scope) {
 }
 
 async function run() {
-  const browser = await webkit.launch({ headless: true });
+  // Usa Chrome real si está disponible
+  const browser = await chromium.launch({
+    headless: HEADLESS.toLowerCase() === "true",
+    channel: BROWSER_CHANNEL || undefined, // "chrome"
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+    ],
+  });
+
+  // Contexto con vídeo y traza
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
     locale: "es-ES",
     timezoneId: "Europe/Madrid",
-    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    recordVideo: { dir: "videos" },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
-  const page = await context.newPage();
 
-  // logs de red/errores a consola del job
-  page.on("console", (msg) => console.log("[console]", msg.type(), msg.text()));
-  page.on("pageerror", (err) => console.log("[pageerror]", err.message));
-  page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
+  // “Stealth” básico
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+
+  const page = await context.newPage();
+  page.on("requestfailed", (req) =>
+    console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText)
+  );
 
   try {
     let attempt = 0, ready = false;
@@ -182,7 +198,6 @@ async function run() {
       await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
       await waitMaskGone(page, 20000);
       await closeCookiesIfAny(page);
-      await forceSpanish(page);
 
       const ctaOk = await clickCTA(page);
       if (!ctaOk) {
@@ -220,6 +235,8 @@ async function run() {
   } catch (e) {
     console.error("Error en la ejecución:", e);
   } finally {
+    // guarda la traza
+    await context.tracing.stop({ path: "traces/trace.zip" }).catch(() => {});
     await context.close();
     await browser.close();
   }
