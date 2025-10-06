@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// SPA sin iframe: maneja loading-mask persistente y reintenta tocando "home".
+// SPA con reintentos: fuerza idioma ES, maneja loading-mask, home y recarga.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -10,7 +10,7 @@ const {
   SERVICIO_TEXT,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  TIMEOUT_MS = "150000", // 150s por si el backend tarda
+  TIMEOUT_MS = "180000", // 180s por lentitud intermitente
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -18,7 +18,7 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
   process.exit(1);
 }
 
-const timeout = Number(TIMEOUT_MS) || 150000;
+const timeout = Number(TIMEOUT_MS) || 180000;
 
 /* ---------- util ---------- */
 
@@ -56,29 +56,49 @@ async function closeCookiesIfAny(scope) {
   } catch {}
 }
 
-async function waitMaskGone(page, maxMs = 40000) {
+async function forceSpanish(scope) {
+  // Forzar idioma ES si el pill "ES" está visible
+  const esBtn = scope.locator('text=/^\\s*ES\\s*$/').first();
+  const visible = await esBtn.isVisible().catch(() => false);
+  if (visible) {
+    await esBtn.click({ timeout: 4000 }).catch(() => {});
+    await scope.waitForTimeout(500);
+  }
+}
+
+async function waitMaskGone(scope, maxMs = 40000) {
   const end = Date.now() + maxMs;
-  const mask = page.locator(".loading-mask");
+  const masks = [
+    scope.locator(".loading-mask"),                     // según tu HTML
+    scope.locator('[aria-busy="true"]'),
+    scope.locator('.v-progress-circular, .spinner, .loading'),
+  ];
   while (Date.now() < end) {
-    const vis = await mask.isVisible().catch(() => false);
-    if (!vis) {
-      await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-      await page.waitForTimeout(600);
+    let anyVisible = false;
+    for (const m of masks) {
+      const vis = await m.first().isVisible().catch(() => false);
+      if (vis) { anyVisible = true; break; }
+    }
+    if (!anyVisible) {
+      if (scope.waitForLoadState) {
+        await scope.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+      }
+      await new Promise(r => setTimeout(r, 600));
       return true;
     }
-    await page.waitForTimeout(400);
+    await new Promise(r => setTimeout(r, 400));
   }
   return false;
 }
 
-async function clickCTA(page) {
+async function clickCTA(scope) {
   const locs = [
-    page.getByText(/Solicitar cita previa/i).first(),
-    page.locator('button:has-text("Solicitar cita previa")').first(),
-    page.locator('a:has-text("Solicitar cita previa")').first(),
-    page.getByText(/Cita previa/i).first(),
-    page.locator('button:has-text("Cita previa")').first(),
-    page.locator('a:has-text("Cita previa")').first(),
+    scope.getByText(/Solicitar cita previa/i).first(),
+    scope.locator('button:has-text("Solicitar cita previa")').first(),
+    scope.locator('a:has-text("Solicitar cita previa")').first(),
+    scope.getByText(/Cita previa/i).first(),
+    scope.locator('button:has-text("Cita previa")').first(),
+    scope.locator('a:has-text("Cita previa")').first(),
   ];
   for (const l of locs) {
     const v = await l.isVisible().catch(() => false);
@@ -87,62 +107,55 @@ async function clickCTA(page) {
   return false;
 }
 
-async function goHomeAndRetry(page) {
-  const home = page.locator(".home").first(); // header: “Cita Previa de Registros Civiles”
+async function pressHome(scope) {
+  const home = scope.locator(".home").first(); // botón/área del header
   const v = await home.isVisible().catch(() => false);
   if (v) {
     await home.click({ timeout: 5000 }).catch(() => {});
-    await page.waitForTimeout(800);
+    await scope.waitForTimeout(800);
     return true;
   }
   return false;
 }
 
-async function waitAppointmentScreen(page, totalWaitMs = 60000) {
+async function waitAppointmentScreen(scope, totalWaitMs = 70000) {
   const probes = [
     /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
     /Siguiente|Següent/i, /Centre i servei/i, /Seleccione centre|servei/i
   ];
   const end = Date.now() + totalWaitMs;
   while (Date.now() < end) {
-    // 1) si hay máscara, espera a que se vaya
-    const gone = await waitMaskGone(page, 5000);
-    // 2) busca marcadores
+    const gone = await waitMaskGone(scope, 5000);
     for (const re of probes) {
-      const loc = page.locator(`text=/${re.source}/${re.flags}`).first();
+      const loc = scope.locator(`text=/${re.source}/${re.flags}`).first();
       if (await loc.isVisible().catch(() => false)) return true;
     }
-    // 3) si la máscara no se va en varios ciclos, toca “home” y reintenta
-    if (!gone) {
-      await goHomeAndRetry(page);
-    }
-    await page.waitForTimeout(500);
+    if (!gone) await scope.waitForTimeout(500);
   }
   return false;
 }
 
-async function selectCenterAndService(page) {
-  // acordeones opcionales
+async function selectCenterAndService(scope) {
   for (const title of [/^\s*Centro\s*$/i, /^\s*Servicio\s*$/i, /^\s*Centre\s*$/i, /^\s*Servei\s*$/i]) {
-    const acc = page.locator(`text=/${title.source}/${title.flags}`).first();
+    const acc = scope.locator(`text=/${title.source}/${title.flags}`).first();
     if (await acc.isVisible().catch(() => false)) {
       await acc.click({ timeout: 3000 }).catch(() => {});
     }
   }
-  const centro = page.locator(`text=/${CENTRO_TEXT}/i`).first();
+  const centro = scope.locator(`text=/${CENTRO_TEXT}/i`).first();
   await centro.scrollIntoViewIfNeeded().catch(() => {});
   await centro.click({ timeout });
 
-  const servicio = page.locator(`text=/${SERVICIO_TEXT}/i`).first();
+  const servicio = scope.locator(`text=/${SERVICIO_TEXT}/i`).first();
   await servicio.scrollIntoViewIfNeeded().catch(() => {});
   await servicio.click({ timeout });
 
   const nexts = [
-    page.getByRole("button", { name: /Siguiente|Següent/i }).first(),
-    page.locator('button:has-text("Siguiente")').first(),
-    page.locator('button:has-text("Següent")').first(),
-    page.locator('text=/Siguiente|Següent/i').first(),
-  ];
+    scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
+    scope.locator('button:has-text("Siguiente")').first(),
+    scope.locator('button:has-text("Següent")').first(),
+    scope.locator('text=/Siguiente|Següent/i').first(),
+  ].filter(Boolean);
   for (const n of nexts) {
     const v = await n.isVisible().catch(() => false);
     if (v) { await n.click({ timeout }); return; }
@@ -150,12 +163,12 @@ async function selectCenterAndService(page) {
   throw new Error('No se pudo pulsar "Siguiente"');
 }
 
-async function checkAvailability(page) {
-  await waitMaskGone(page, 20000);
-  const noDays = await page.locator('text=/No hay días disponibles|No hi ha dies disponibles/i').first().isVisible().catch(() => false);
-  const noHours = await page.locator('text=/No hay horas disponibles|No hi ha hores disponibles/i').first().isVisible().catch(() => false);
+async function checkAvailability(scope) {
+  await waitMaskGone(scope, 20000);
+  const noDays = await scope.locator('text=/No hay días disponibles|No hi ha dies disponibles/i').first().isVisible().catch(() => false);
+  const noHours = await scope.locator('text=/No hay horas disponibles|No hi ha hores disponibles/i').first().isVisible().catch(() => false);
   if (!noDays || !noHours) return true;
-  const clickableDays = page.locator("button, [role='button']").filter({ hasText: /\b\d{1,2}\b/ });
+  const clickableDays = scope.locator("button, [role='button']").filter({ hasText: /\b\d{1,2}\b/ });
   return (await clickableDays.count()) > 0;
 }
 
@@ -165,33 +178,49 @@ async function run() {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
   const page = await context.newPage();
 
-  // Logs de depuración (quedan en el output del job)
+  // logs
   page.on("console", (msg) => console.log("[console]", msg.type(), msg.text()));
   page.on("pageerror", (err) => console.log("[pageerror]", err.message));
   page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
 
   try {
-    // HOME
-    await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
-    await waitMaskGone(page, 15000);
-    await closeCookiesIfAny(page);
-    await page.waitForTimeout(800);
+    let attempt = 0, ready = false;
 
-    // CTA
-    const ctaOk = await clickCTA(page);
-    if (!ctaOk) {
-      await page.screenshot({ path: "home.png", fullPage: true }).catch(() => {});
-      fs.writeFileSync("home.html", await page.content());
-      throw new Error('No se pudo clicar "Solicitar cita previa"');
+    while (attempt < 3 && !ready) {
+      attempt++;
+      console.log(`== Intento ${attempt} ==`);
+
+      // HOME
+      await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
+      await waitMaskGone(page, 15000);
+      await closeCookiesIfAny(page);
+      await forceSpanish(page);
+      await page.waitForTimeout(500);
+
+      // CTA
+      const ctaOk = await clickCTA(page);
+      if (!ctaOk) {
+        await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
+        fs.writeFileSync(`home_${attempt}.html`, await page.content());
+        // intentamos forzar refresco y repetimos
+        await pressHome(page);
+        continue;
+      }
+
+      // Esperar pantalla Centro/Servicio
+      ready = await waitAppointmentScreen(page, 90000);
+      if (!ready) {
+        // refrescar vía home y reintentar
+        await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
+        fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
+        await pressHome(page);
+      }
     }
 
-    // Pantalla Centro/Servicio (con reintentos: máscara + home)
-    const ready = await waitAppointmentScreen(page, 90000);
     if (!ready) {
       await page.screenshot({ path: "after_cta.png", fullPage: true }).catch(() => {});
       fs.writeFileSync("after_cta.html", await page.content());
@@ -211,12 +240,4 @@ async function run() {
     } else {
       console.log(`Sin disponibilidad de cita por ahora (Centro: ${CENTRO_TEXT} · Servicio: ${SERVICIO_TEXT}).`);
     }
-  } catch (e) {
-    console.error("Error en la ejecución:", e);
-  } finally {
-    await context.close();
-    await browser.close();
-  }
-}
-
-run();
+  } catch (
