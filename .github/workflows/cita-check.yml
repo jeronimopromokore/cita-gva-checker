@@ -17,22 +17,21 @@ jobs:
         with:
           node-version: 20
 
-      # Windows (runner local): instala dependencias SIN --with-deps
+      # Instalación de dependencias en Windows
       - name: Install deps (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
         run: |
           npm install
           npx playwright install
 
-      # Linux/macOS (por si algún día mueves el runner)
+      # Instalación de dependencias en Linux/macOS
       - name: Install deps (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           npm install
           npx playwright install --with-deps
 
-      # IMPORTANTE: ejecuta en modo "no headless" en tu PC y fuerza Chrome real
+      # Ejecución del script principal
       - name: Run checker
         env:
           CENTRO_TEXT: ${{ secrets.CENTRO_TEXT }}
@@ -40,10 +39,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TIMEOUT_MS: "180000"
-          HEADLESS: "false"        # <- abre ventana del navegador en tu PC
-          BROWSER_CHANNEL: "chrome" # <- usa tu Google Chrome
+          HEADLESS: "false"         # Muestra el navegador real (útil para depurar)
+          BROWSER_CHANNEL: "chrome" # Usa Google Chrome instalado en tu PC
         run: npm run check
 
+      # Subida de capturas, HTML, trazas y vídeos para depurar
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
