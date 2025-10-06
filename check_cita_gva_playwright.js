@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// Deep-link + acordeones + scroll virtual + click nativo en ancestro clicable.
+// Deep-link + acordeones + selección robusta de SERVICIO (buscador, scroll virtual, click por bbox).
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -27,7 +27,7 @@ const TRACES_DIR = path.resolve("traces");
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-/* ---------- helpers genéricos ---------- */
+/* ---------- utilidades ---------- */
 
 async function waitMaskGone(scope, maxMs = 45000) {
   const end = Date.now() + maxMs;
@@ -43,10 +43,10 @@ async function waitMaskGone(scope, maxMs = 45000) {
     }
     if (!anyVisible) {
       await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(() => {});
-      await scope.waitForTimeout?.(300);
+      await scope.waitForTimeout?.(250);
       return true;
     }
-    await scope.waitForTimeout?.(250);
+    await scope.waitForTimeout?.(200);
   }
   return false;
 }
@@ -78,7 +78,7 @@ async function onAppointmentScreen(scope, totalWaitMs = 60000) {
       const el = scope.locator(`text=/${re.source}/${re.flags}`).first();
       if (await el.isVisible().catch(() => false)) return true;
     }
-    if (!gone) await scope.waitForTimeout?.(300);
+    if (!gone) await scope.waitForTimeout?.(250);
   }
   return false;
 }
@@ -100,7 +100,7 @@ async function tryDeepLink(page) {
   return ok;
 }
 
-/* ---------- acordeones y selección robusta ---------- */
+/* ---------- acordeones ---------- */
 
 async function expandAllAccordions(scope) {
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link');
@@ -110,22 +110,23 @@ async function expandAllAccordions(scope) {
     const h = headers.nth(i);
     try {
       await h.scrollIntoViewIfNeeded().catch(() => {});
-      let opened = false;
-      for (const tryClick of [
-        () => h.click({ timeout: 1200 }),
-        () => h.click({ timeout: 1200, force: true }),
-        () => h.evaluate(el => el && el.click()),
-      ]) {
-        try { await tryClick(); opened = true; break; } catch {}
+      // intenta abrir si no está expandido
+      const expanded = await h.getAttribute("aria-expanded").catch(() => null);
+      if (expanded !== "true") {
+        for (const tryClick of [
+          () => h.click({ timeout: 1200 }),
+          () => h.click({ timeout: 1200, force: true }),
+          () => h.evaluate(el => el && el.click()),
+        ]) { try { await tryClick(); break; } catch {} }
+        await scope.waitForTimeout(150);
       }
-      if (opened) await scope.waitForTimeout(150);
     } catch {}
   }
 }
 
-async function ensurePanelOpen(scope, panelTitleRegex) {
+async function ensurePanelOpen(scope, titleRe) {
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link')
-    .filter({ hasText: panelTitleRegex });
+    .filter({ hasText: titleRe });
   const n = await headers.count();
   for (let i = 0; i < n; i++) {
     const h = headers.nth(i);
@@ -138,72 +139,92 @@ async function ensurePanelOpen(scope, panelTitleRegex) {
           () => h.click({ timeout: 1200, force: true }),
           () => h.evaluate(el => el && el.click()),
         ]) { try { await tryClick(); break; } catch {} }
-        await scope.waitForTimeout(200);
+        await scope.waitForTimeout(150);
       }
     } catch {}
   }
 }
 
-/**
- * Busca el elemento por texto (regex), hace scroll dentro del panel de contenido
- * y hace click sobre el mejor ancestro clicable (button/a/label/li/[role=option]...).
- */
-async function findAndClickOption(scope, panelRegex, optionRegex) {
-  // 1) ubica el panel de contenido asociado (región debajo del header)
-  const panelRegion = scope.locator(
-    '.p-accordion-content, [role="region"], .p-panel-content'
-  ).filter({ has: scope.locator(`text=/${panelRegex.source}/${panelRegex.flags}`) }).first();
+/* ---------- selección dentro del panel ---------- */
 
-  // si no encuentra por “has:”, cae al primer content visible
-  const container = (await panelRegion.isVisible().catch(()=>false))
-    ? panelRegion
-    : scope.locator('.p-accordion-content:visible, [role="region"]:visible, .p-panel-content:visible').first();
+function panelContent(scope, titleRe) {
+  // Encuentra el tab por título y luego su contenido asociado más cercano
+  const tab = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link').filter({ hasText: titleRe }).first();
+  const container = tab.locator('xpath=following::*[contains(@class,"p-accordion-content") or @role="region" or contains(@class,"p-panel-content")][1]');
+  return container;
+}
 
-  // 2) scroll incremental para encontrar el texto dentro del contenedor
-  const MAX_STEPS = 20;
-  for (let step = 0; step < MAX_STEPS; step++) {
-    // Localizador del texto dentro del contenedor
-    const textNode = container.locator(`text=/${optionRegex.source}/${optionRegex.flags}`).first();
-    if (await textNode.isVisible().catch(()=>false)) {
-      // 3) intenta click directo y ancestros clicables
-      const candidates = [
-        textNode,
-        textNode.locator('xpath=ancestor-or-self::*[self::button or self::a or self::label or self::li or @role="option" or @role="radio" or @role="menuitem"][1]')
+async function tryServiceSearch(container, text) {
+  // Intenta escribir en inputs dentro del panel (PrimeNG: autocomplete / dropdown)
+  const inputs = container.locator('input[role="combobox"], input[type="search"], input[type="text"], .p-inputtext input, .p-autocomplete input, .p-dropdown input').filter({ hasNot: container.locator('[type="hidden"]') });
+  const k = await inputs.count();
+  for (let i = 0; i < k; i++) {
+    const inp = inputs.nth(i);
+    try {
+      await inp.scrollIntoViewIfNeeded().catch(()=>{});
+      await inp.fill(""); await inp.type(text, { delay: 30 });
+      await container.waitForTimeout(400);
+      // Opciones emergentes habituales de PrimeNG
+      const popupOptions = [
+        container.getByRole("option", { name: new RegExp(text, "i") }),
+        container.locator('.p-autocomplete-panel .p-autocomplete-items .p-autocomplete-item').filter({ hasText: new RegExp(text, "i") }),
+        container.locator('.p-dropdown-items .p-dropdown-item').filter({ hasText: new RegExp(text, "i") }),
       ];
-      for (const cand of candidates) {
-        try {
-          await cand.scrollIntoViewIfNeeded().catch(()=>{});
+      for (const pop of popupOptions) {
+        const vis = await pop.first().isVisible().catch(()=>false);
+        if (vis) {
           for (const tryClick of [
-            () => cand.click({ timeout: 2000 }),
-            () => cand.click({ timeout: 2000, force: true }),
-            () => cand.evaluate(el => {
-              if (!el) return;
-              const r = el.getBoundingClientRect();
-              const x = r.left + r.width/2, y = r.top + r.height/2;
-              const evt = (type) => el.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y}));
-              evt('mouseover'); evt('mousedown'); evt('mouseup'); evt('click');
-            }),
-          ]) {
-            try { await tryClick(); return true; } catch {}
+            () => pop.first().click({ timeout: 1500 }),
+            () => pop.first().click({ timeout: 1500, force: true }),
+            () => pop.first().evaluate(el => el && el.click()),
+          ]) { try { await tryClick(); return true; } catch {} }
+        }
+      }
+    } catch {}
+  }
+  return false;
+}
+
+async function scrollAndClickOption(container, text) {
+  // Busca elementos clicables por múltiples roles/selectores, con scroll incremental
+  const re = new RegExp(text, "i");
+  const MAX_STEPS = 30;
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const candidates = [
+      container.getByRole("option", { name: re }),
+      container.getByRole("radio", { name: re }),
+      container.locator('li, label, button, a, [role="menuitem"], [role="treeitem"]').filter({ hasText: re }),
+      container.locator(`text=/${re.source}/${re.flags}`),
+    ];
+    for (const cand of candidates) {
+      const el = cand.first();
+      if (await el.isVisible().catch(()=>false)) {
+        // 1) click normal / force
+        for (const tryClick of [
+          () => el.click({ timeout: 1500 }),
+          () => el.click({ timeout: 1500, force: true }),
+        ]) { try { await tryClick(); return true; } catch {} }
+        // 2) click nativo por bbox si aún intercepta algo
+        try {
+          const box = await el.boundingBox();
+          if (box) {
+            await container.page().mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            await container.page().mouse.down(); await container.page().mouse.up();
+            return true;
           }
         } catch {}
       }
     }
-
-    // 4) si no es visible aún, hace scroll del contenedor
-    try {
-      const scrolled = await container.evaluate((el) => {
-        if (!el) return false;
-        const before = el.scrollTop;
-        el.scrollTop = Math.min(el.scrollTop + 300, el.scrollHeight);
-        return el.scrollTop !== before;
-      }).catch(()=>false);
-      if (!scrolled) {
-        // si no se puede scrollear más, prueba a scrollear la página
-        await scope.mouse.wheel(0, 500).catch(()=>{});
-      }
-    } catch {}
-    await scope.waitForTimeout?.(200);
+    // scroll del contenedor; si no se mueve, scroll global
+    const scrolled = await container.evaluate((node) => {
+      if (!node) return false;
+      const el = node;
+      const before = el.scrollTop;
+      el.scrollTop = Math.min(el.scrollTop + 350, el.scrollHeight);
+      return el.scrollTop !== before;
+    }).catch(()=>false);
+    if (!scrolled) { await container.page().mouse.wheel(0, 600).catch(()=>{}); }
+    await container.page().waitForTimeout(180);
   }
   return false;
 }
@@ -213,40 +234,44 @@ async function selectCenterAndService(scope) {
   await ensurePanelOpen(scope, /Centro|Centre/i);
   await ensurePanelOpen(scope, /Servicio|Servei/i);
 
-  // CENTRO
-  const centroOK =
-    (await findAndClickOption(scope, /Centro|Centre/i, new RegExp(CENTRO_TEXT, "i"))) ||
-    (await scope.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 2000 }).then(()=>true).catch(()=>false));
-  if (!centroOK) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
+  // CENTRO (similar al servicio, pero suele ser más sencillo)
+  {
+    const cont = panelContent(scope, /Centro|Centre/i);
+    const ok =
+      (await scrollAndClickOption(cont, CENTRO_TEXT)) ||
+      (await scope.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
+    if (!ok) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
+  }
 
-  // SERVICIO
-  const servOK =
-    (await findAndClickOption(scope, /Servicio|Servei/i, new RegExp(SERVICIO_TEXT, "i"))) ||
-    (await scope.locator(`text=/${SERVICIO_TEXT}/i`).first().click({ timeout: 2000 }).then(()=>true).catch(()=>false));
-  if (!servOK) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
+  // SERVICIO: primero intenta buscador, luego scroll + múltiples selectores
+  {
+    const cont = panelContent(scope, /Servicio|Servei/i);
+    // guarda HTML del panel para depuración si falla
+    try { fs.writeFileSync("service_panel.html", await cont.innerHTML()); } catch {}
+    const ok =
+      (await tryServiceSearch(cont, SERVICIO_TEXT)) ||
+      (await scrollAndClickOption(cont, SERVICIO_TEXT));
+    if (!ok) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
+  }
 
-  // Siguiente
+  // Botón Siguiente
   const nexts = [
     scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
     scope.locator('button:has-text("Siguiente")').first(),
     scope.locator('button:has-text("Següent")').first(),
     scope.locator('text=/Siguiente|Següent/i').first(),
   ].filter(Boolean);
-  let clickedNext = false;
   for (const n of nexts) {
-    try {
-      const v = await n.isVisible().catch(() => false);
-      if (v) {
-        for (const tryClick of [
-          () => n.click({ timeout: 1500 }),
-          () => n.click({ timeout: 1500, force: true }),
-          () => n.evaluate(el => el && el.click()),
-        ]) { try { await tryClick(); clickedNext = true; break; } catch {} }
-      }
-      if (clickedNext) break;
-    } catch {}
+    const v = await n.isVisible().catch(() => false);
+    if (v) {
+      for (const tryClick of [
+        () => n.click({ timeout: 1500 }),
+        () => n.click({ timeout: 1500, force: true }),
+        () => n.evaluate(el => el && el.click()),
+      ]) { try { await tryClick(); return; } catch {} }
+    }
   }
-  if (!clickedNext) throw new Error('No se pudo pulsar "Siguiente"');
+  throw new Error('No se pudo pulsar "Siguiente"');
 }
 
 /* ---------- main ---------- */
@@ -275,12 +300,9 @@ async function run() {
 
     await selectCenterAndService(page);
 
-    // Espera breve por transición de pantalla siguiente (calendario)
     await waitMaskGone(page, 5000);
-
-    // Aquí puedes añadir el chequeo de disponibilidad si quieres continuar.
-    console.log("Centro y servicio seleccionados correctamente.");
     await page.screenshot({ path: "state.png", fullPage: true }).catch(() => {});
+    console.log("Centro y servicio seleccionados correctamente.");
   } catch (e) {
     console.error("Error en la ejecución:", e);
   } finally {
