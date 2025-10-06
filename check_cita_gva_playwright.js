@@ -1,8 +1,9 @@
 // check_cita_gva_playwright.js
-// SPA GVA: Chrome real + "stealth" + espera por red + reintentos + vídeo + traza.
+// Chrome real + perfil persistente (reutiliza cookies/estado) + vídeo + traza + reintentos.
 
-import { chromium } from "playwright";
+import { chromium, webkit } from "playwright";
 import fs from "fs";
+import path from "path";
 
 const {
   GVA_URL = "https://sige.gva.es/qsige/citaprevia.justicia/#/es/home",
@@ -11,8 +12,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
-  HEADLESS = "false",        // puedes forzarlo desde el workflow
-  BROWSER_CHANNEL = "chrome" // usa tu Google Chrome si está instalado
+  HEADLESS = "false",
+  BROWSER_CHANNEL = "chrome"
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -22,7 +23,13 @@ if (!CENTRO_TEXT || !SERVICIO_TEXT) {
 
 const timeout = Number(TIMEOUT_MS) || 180000;
 
-/* ---------------- utilidades ---------------- */
+// Carpeta de perfil persistente (queda en el workspace del runner local)
+const PROFILE_DIR = path.resolve("chrome-profile"); // se conserva entre runs
+const VIDEOS_DIR = path.resolve("videos");
+const TRACES_DIR = path.resolve("traces");
+fs.mkdirSync(PROFILE_DIR, { recursive: true });
+fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+fs.mkdirSync(TRACES_DIR, { recursive: true });
 
 async function notifyTelegram(message, screenshotPath) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -84,11 +91,12 @@ async function waitMaskGone(scope, maxMs = 45000) {
 }
 
 async function humanNudge(page) {
-  // Pequeños gestos para “desatascar” SPAs quisquillosas
-  await page.mouse.move(200, 200).catch(()=>{});
-  await page.mouse.wheel(0, 800).catch(()=>{});
-  await page.keyboard.press("Escape").catch(()=>{});
-  await page.waitForTimeout(400);
+  try {
+    await page.mouse.move(200, 200);
+    await page.mouse.wheel(0, 600);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+  } catch {}
 }
 
 async function clickCTA(scope) {
@@ -100,7 +108,6 @@ async function clickCTA(scope) {
     scope.locator('button:has-text("Cita previa")').first(),
     scope.locator('a:has-text("Cita previa")').first(),
   ];
-  // doble intento por si el primer click no “engancha”
   for (let pass = 0; pass < 2; pass++) {
     for (const l of candidates) {
       const v = await l.isVisible().catch(() => false);
@@ -117,7 +124,6 @@ async function clickCTA(scope) {
 }
 
 async function waitAppointmentScreen(scope, totalWaitMs = 90000) {
-  // Espera por UI o por red (cualquier señal razonable de que “cambió de vista”)
   const end = Date.now() + totalWaitMs;
   const uiProbes = [
     /Centro y servicio/i, /Seleccione centro/i, /Seleccione servicio/i,
@@ -125,21 +131,18 @@ async function waitAppointmentScreen(scope, totalWaitMs = 90000) {
   ];
   while (Date.now() < end) {
     const gone = await waitMaskGone(scope, 5000);
-    // 1) Señales de UI
     for (const re of uiProbes) {
       const loc = scope.locator(`text=/${re.source}/${re.flags}`).first();
       if (await loc.isVisible().catch(() => false)) return true;
     }
-    // 2) Señales de red (cualquier XHR/fetch a “cita”, “appointment”, “slot”, “centro”, “servicio”)
     const ok = await scope.waitForResponse(
       (res) => {
         const u = res.url();
-        return /cita|appointment|slot|centro|servicio/i.test(u) && res.status() < 500;
+        return /cita|appointment|slot|centro|servicio|agenda|disponible/i.test(u) && res.status() < 500;
       },
       { timeout: 2500 }
     ).then(()=>true).catch(()=>false);
     if (ok) return true;
-
     if (!gone) await scope.waitForTimeout(600);
   }
   return false;
@@ -178,38 +181,49 @@ async function checkAvailability(scope) {
   return (await clickableDays.count()) > 0;
 }
 
+async function launchPersistentChrome() {
+  try {
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      headless: HEADLESS.toLowerCase() === "true" ? true : false,
+      channel: BROWSER_CHANNEL || "chrome",
+      viewport: null,                 // ventana “real”
+      recordVideo: { dir: VIDEOS_DIR },
+      locale: "es-ES",
+      timezoneId: "Europe/Madrid",
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    });
+    // Stealth básico
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
+    return context;
+  } catch (e) {
+    console.error("Fallo lanzando Chrome persistente, probando WebKit fallback:", e?.message || e);
+    // Fallback a WebKit (por si Chrome falla)
+    const wk = await webkit.launch({ headless: HEADLESS.toLowerCase() === "true" });
+    const context = await wk.newContext({
+      viewport: { width: 1366, height: 900 },
+      locale: "es-ES",
+      timezoneId: "Europe/Madrid",
+      recordVideo: { dir: VIDEOS_DIR },
+    });
+    return context;
+  }
+}
+
 /* ---------------- main ---------------- */
 
 async function run() {
-  const browser = await chromium.launch({
-    headless: HEADLESS.toLowerCase() === "true",
-    channel: BROWSER_CHANNEL || undefined,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-    ],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-    locale: "es-ES",
-    timezoneId: "Europe/Madrid",
-    recordVideo: { dir: "videos" },
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-  });
-
-  // “Stealth” básico
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
-
+  const context = await launchPersistentChrome();
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
   const page = await context.newPage();
 
-  // logs de red (se ven en el job)
   page.on("requestfailed", (req) =>
     console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText)
   );
@@ -225,7 +239,6 @@ async function run() {
       await waitMaskGone(page, 20000);
       await closeCookiesIfAny(page);
 
-      // Clic CTA (hasta dos veces)
       const cta1 = await clickCTA(page);
       if (!cta1) {
         await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
@@ -233,18 +246,19 @@ async function run() {
         continue;
       }
 
-      // Espera a “Centro y servicio” por UI o por red
       ready = await waitAppointmentScreen(page, 90000);
 
-      // Si sigue sin estar listo, intentamos “nudge” y recarga suave
       if (!ready) {
         await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-        await humanNudge(page);
-        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
-        await waitMaskGone(page, 15000);
-        // segundo intento de detectar
-        ready = await waitAppointmentScreen(page, 40000);
+        // “soft refresh” para SPAs: volver a home y reentrar con estado mantenido por perfil
+        try {
+          await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
+          await waitMaskGone(page, 15000);
+          await closeCookiesIfAny(page);
+          await clickCTA(page);
+          ready = await waitAppointmentScreen(page, 40000);
+        } catch {}
       }
     }
 
@@ -254,10 +268,8 @@ async function run() {
       throw new Error('No se cargó la pantalla "Centro y servicio"');
     }
 
-    // Selección y siguiente
     await selectCenterAndService(page);
 
-    // Disponibilidad
     const available = await checkAvailability(page);
     await page.screenshot({ path: "state.png", fullPage: true }).catch(() => {});
     if (available) {
@@ -270,9 +282,8 @@ async function run() {
   } catch (e) {
     console.error("Error en la ejecución:", e);
   } finally {
-    await context.tracing.stop({ path: "traces/trace.zip" }).catch(() => {});
+    await context.tracing.stop({ path: path.join(TRACES_DIR, "trace.zip") }).catch(() => {});
     await context.close();
-    await browser.close();
   }
 }
 
