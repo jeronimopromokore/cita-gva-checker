@@ -1,0 +1,32 @@
+name: GVA Cita Checker
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # Cada 30 minutos (UTC)
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: |
+          npm ci || npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run checker
+        env:
+          GVA_URL: ${{ secrets.GVA_URL }}
+          CENTRO_TEXT: ${{ secrets.CENTRO_TEXT }}
+          SERVICIO_TEXT: ${{ secrets.SERVICIO_TEXT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TIMEOUT_MS: "60000"
+        run: npm run check
