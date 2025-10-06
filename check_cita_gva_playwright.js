@@ -1,6 +1,5 @@
 // check_cita_gva_playwright.js
-// Chrome real + perfil persistente + sin --enable-automation + limpieza SW/cachés.
-// Reintentos, vídeo y traza para depurar.
+// Spinner killer: Chrome real + perfil persistente + sin --enable-automation + limpiar SW/caché + hard-reload.
 
 import { chromium, firefox } from "playwright";
 import fs from "fs";
@@ -121,7 +120,6 @@ async function waitAppointmentScreen(scope, totalWaitMs = 90000) {
       const loc = scope.locator?.(`text=/${re.source}/${re.flags}`).first();
       if (loc && await loc.isVisible().catch(() => false)) return true;
     }
-    // Señal de red de que cargó catálogo/agenda
     const ok = await scope.waitForResponse?.(
       res => /cita|appointment|slot|centro|servicio|agenda|disponible/i.test(res.url()) && res.status() < 500,
       { timeout: 2500 }
@@ -165,12 +163,11 @@ async function checkAvailability(scope) {
 }
 
 async function launchPersistentChrome() {
-  // 1) Intento con Chrome persistente y sin --enable-automation
   try {
     const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless: HEADLESS.toLowerCase() === "true",
       channel: "chrome",
-      viewport: null, // ventana real
+      viewport: null,
       ignoreDefaultArgs: ["--enable-automation"], // quita banda y reduce detección
       recordVideo: { dir: VIDEOS_DIR },
       locale: "es-ES",
@@ -182,14 +179,13 @@ async function launchPersistentChrome() {
         "--disable-dev-shm-usage",
       ],
     });
-    // stealth mínimo
-    await ctx.addInitScript(() => Object.defineProperty(navigator, "webdriver", { get: () => undefined }));
+    await ctx.addInitScript(() =>
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined })
+    );
     return ctx;
   } catch (e) {
     console.error("Chrome persistente falló, pruebo Firefox:", e?.message || e);
   }
-
-  // 2) Fallback a Firefox, que suele esquivar detecciones de Chromium
   const ff = await firefox.launch({ headless: HEADLESS.toLowerCase() === "true" });
   return await ff.newContext({
     viewport: { width: 1366, height: 900 },
@@ -199,22 +195,20 @@ async function launchPersistentChrome() {
   });
 }
 
-async function run() {
-  const context = await launchPersistentChrome();
-  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-  const page = await context.newPage();
+/* ---------------- main ---------------- */
 
-  // Limpia SW y cachés del dominio ANTES de navegar (evita estados rotos)
+async function hardReload(page) {
+  // “Ctrl+F5” para forzar recursos frescos
   try {
-    await page.goto("about:blank");
-    await page.addInitScript(() => {
-      // se ejecutará en cada nueva página
-      try { Object.defineProperty(navigator, "webdriver", { get: () => undefined }); } catch {}
-    });
+    await page.keyboard.down("Control");
+    await page.keyboard.press("F5");
+    await page.keyboard.up("Control");
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(()=>{});
   } catch {}
+}
+
+async function clearSWAndCache(page) {
   try {
-    // intentaremos limpiar al entrar en el dominio
-    await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
     await page.evaluate(async () => {
       try {
         const regs = await navigator.serviceWorker?.getRegistrations?.();
@@ -224,11 +218,15 @@ async function run() {
         const keys = await caches?.keys?.();
         if (keys) for (const k of keys) try { await caches.delete(k); } catch {}
       } catch {}
-    }).catch(()=>{});
-    await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
+    });
   } catch {}
+}
 
-  // A partir de aquí sigue el flujo normal
+async function run() {
+  const context = await launchPersistentChrome();
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  const page = await context.newPage();
+
   page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
 
   try {
@@ -238,16 +236,23 @@ async function run() {
       attempt++;
       console.log(`== Intento ${attempt} ==`);
 
-      // Asegura estado limpio en cada intento (sin SW activos)
+      await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
       await waitMaskGone(page, 15000);
       await closeCookiesIfAny(page);
+
+      // Si sólo vemos spinner, forzar hard-reload y limpiar SW/caché
+      const spinnerStuck = await page.locator(".loading-mask, .spinner, .v-progress-circular").first().isVisible().catch(()=>false);
+      if (spinnerStuck) {
+        await clearSWAndCache(page);
+        await hardReload(page);
+        await waitMaskGone(page, 15000);
+      }
 
       const ctaOk = await clickCTA(page);
       if (!ctaOk) {
         await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`home_${attempt}.html`, await page.content());
-        // reintenta con recarga
-        await page.reload({ waitUntil: "domcontentloaded" }).catch(()=>{});
+        await hardReload(page);
         continue;
       }
 
@@ -256,20 +261,7 @@ async function run() {
       if (!ready) {
         await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
         fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-
-        // fuerza limpieza de SW/caché y reintenta
-        try {
-          await page.evaluate(async () => {
-            try {
-              const regs = await navigator.serviceWorker?.getRegistrations?.();
-              if (regs) for (const r of regs) try { await r.unregister(); } catch {}
-            } catch {}
-            try {
-              const keys = await caches?.keys?.();
-              if (keys) for (const k of keys) try { await caches.delete(k); } catch {}
-            } catch {}
-          });
-        } catch {}
+        await clearSWAndCache(page);
         await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout }).catch(()=>{});
         await waitMaskGone(page, 15000);
         await closeCookiesIfAny(page);
