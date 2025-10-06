@@ -1,7 +1,5 @@
 // check_cita_gva_playwright.js
-// 1º intenta deep-link: /es/appointment?uuid=...  → si carga, sigue.
-// Si no, cae al flujo antiguo desde /es/home.
-// Graba vídeo y traza para depurar.
+// Deep-link + acordeones robustos + múltiples estrategias de click.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -9,15 +7,15 @@ import path from "path";
 
 const {
   GVA_BASE = "https://sige.gva.es/qsige/citaprevia.justicia",
-  APPOINTMENT_UUID,                 // <- añade este secret si puedes
-  APPOINTMENT_URL,                  // <- o pásalo entero si prefieres
+  APPOINTMENT_UUID,
+  APPOINTMENT_URL,
   CENTRO_TEXT,
   SERVICIO_TEXT,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TIMEOUT_MS = "180000",
   HEADLESS = "false",
-  BROWSER_CHANNEL = "chrome"        // usa tu Chrome si está en el runner
+  BROWSER_CHANNEL = "chrome",
 } = process.env;
 
 if (!CENTRO_TEXT || !SERVICIO_TEXT) {
@@ -31,26 +29,7 @@ const TRACES_DIR = path.resolve("traces");
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-/* ---------- helpers ---------- */
-
-async function notifyTelegram(message, screenshotPath) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const api = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-  try {
-    await fetch(`${api}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, disable_web_page_preview: true }),
-    });
-    if (screenshotPath) {
-      const form = new FormData();
-      form.set("chat_id", TELEGRAM_CHAT_ID);
-      form.set("caption", "Estado actual");
-      form.set("photo", new Blob([fs.readFileSync(screenshotPath)]), "captura.png");
-      await fetch(`${api}/sendPhoto`, { method: "POST", body: form });
-    }
-  } catch {}
-}
+/* ---------------- utilidades ---------------- */
 
 async function waitMaskGone(scope, maxMs = 45000) {
   const end = Date.now() + maxMs;
@@ -66,10 +45,10 @@ async function waitMaskGone(scope, maxMs = 45000) {
     }
     if (!anyVisible) {
       await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(() => {});
-      await scope.waitForTimeout?.(400);
+      await scope.waitForTimeout?.(300);
       return true;
     }
-    await scope.waitForTimeout?.(300);
+    await scope.waitForTimeout?.(250);
   }
   return false;
 }
@@ -77,7 +56,7 @@ async function waitMaskGone(scope, maxMs = 45000) {
 async function closeCookiesIfAny(scope) {
   try {
     const cands = [
-      scope.getByRole?.("button", { name: /aceptar|acepto|consentir|aceptar todas/i }),
+      scope.getByRole?.("button", { name: /acept(ar|o)|consentir|aceptar todas/i }),
       scope.locator?.('button:has-text("Aceptar")'),
       scope.locator?.('text=/Aceptar todas/i'),
       scope.locator?.('text=/Acceptar totes/i'),
@@ -101,7 +80,7 @@ async function onAppointmentScreen(scope, totalWaitMs = 60000) {
       const el = scope.locator(`text=/${re.source}/${re.flags}`).first();
       if (await el.isVisible().catch(() => false)) return true;
     }
-    if (!gone) await scope.waitForTimeout?.(400);
+    if (!gone) await scope.waitForTimeout?.(300);
   }
   return false;
 }
@@ -112,7 +91,6 @@ async function tryDeepLink(page) {
     : (APPOINTMENT_UUID ? `${GVA_BASE}/#/es/appointment?uuid=${APPOINTMENT_UUID}` : null);
 
   if (!url) return false;
-
   console.log("→ Intentando deep-link:", url);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout });
   await closeCookiesIfAny(page);
@@ -124,50 +102,106 @@ async function tryDeepLink(page) {
   return ok;
 }
 
-async function clickCTA(scope) {
-  const locs = [
-    scope.getByText?.(/Solicitar cita previa/i).first(),
-    scope.locator?.('button:has-text("Solicitar cita previa")').first(),
-    scope.locator?.('a:has-text("Solicitar cita previa")').first(),
-    scope.getByText?.(/Cita previa/i).first(),
-    scope.locator?.('button:has-text("Cita previa")').first(),
-    scope.locator?.('a:has-text("Cita previa")').first(),
-  ].filter(Boolean);
-  for (let pass = 0; pass < 2; pass++) {
-    for (const l of locs) {
-      if (await l.isVisible().catch(() => false)) {
-        await l.scrollIntoViewIfNeeded().catch(()=>{});
-        await l.click({ timeout: 10000 }).catch(()=>{});
-        await scope.waitForTimeout?.(300);
-        return true;
+async function expandAllAccordions(scope) {
+  // Abre TODOS los acordeones visibles (PrimeNG p-accordion)
+  const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link');
+  const count = await headers.count();
+  console.log(`→ Detectados ${count} acordeones`);
+  for (let i = 0; i < count; i++) {
+    const h = headers.nth(i);
+    try {
+      await h.scrollIntoViewIfNeeded().catch(() => {});
+      // varios intentos de apertura
+      let opened = false;
+      for (const tryClick of [
+        () => h.click({ timeout: 1500 }),
+        () => h.click({ timeout: 1500, force: true }),
+        () => h.evaluate(node => (node as HTMLElement).click()),
+      ]) {
+        try { await tryClick(); opened = true; break; } catch {}
       }
-    }
-    await scope.waitForTimeout?.(300);
+      if (opened) await scope.waitForTimeout(200);
+    } catch {}
+  }
+}
+
+async function ensurePanelOpen(scope, panelTitleRegex) {
+  // Abre específicamente el panel cuyo header contenga "Centro" o "Servicio"
+  const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link')
+    .filter({ hasText: panelTitleRegex });
+  const count = await headers.count();
+  for (let i = 0; i < count; i++) {
+    const h = headers.nth(i);
+    try {
+      await h.scrollIntoViewIfNeeded().catch(() => {});
+      // si está aria-expanded="true" lo dejamos
+      const expanded = await h.getAttribute("aria-expanded").catch(() => null);
+      if (expanded !== "true") {
+        for (const tryClick of [
+          () => h.click({ timeout: 1500 }),
+          () => h.click({ timeout: 1500, force: true }),
+          () => h.evaluate(node => (node as HTMLElement).click()),
+        ]) {
+          try { await tryClick(); break; } catch {}
+        }
+        await scope.waitForTimeout(250);
+      }
+    } catch {}
+  }
+}
+
+async function robustClickText(scope, textRegex) {
+  const t = scope.locator(`text=/${textRegex.source}/${textRegex.flags}`).first();
+  await t.scrollIntoViewIfNeeded().catch(() => {});
+  // 3 estrategias en cascada
+  for (const tryClick of [
+    () => t.click({ timeout: 4000 }),
+    () => t.click({ timeout: 4000, force: true }),
+    () => t.evaluate(node => (node as HTMLElement).click()),
+  ]) {
+    try { await tryClick(); return true; } catch {}
+    await scope.waitForTimeout?.(150);
   }
   return false;
 }
 
 async function selectCenterAndService(scope) {
-  for (const title of [/^\s*Centro\s*$/i, /^\s*Servicio\s*$/i, /^\s*Centre\s*$/i, /^\s*Servei\s*$/i]) {
-    const acc = scope.locator(`text=/${title.source}/${title.flags}`).first();
-    if (await acc.isVisible().catch(() => false)) { await acc.click({ timeout: 3000 }).catch(() => {}); }
-  }
-  const centro = scope.locator(`text=/${CENTRO_TEXT}/i`).first();
-  await centro.scrollIntoViewIfNeeded().catch(() => {}); await centro.click({ timeout });
+  // 1) abre todos y luego asegura paneles clave abiertos
+  await expandAllAccordions(scope);
+  await ensurePanelOpen(scope, /Centro|Centre/i);
+  await ensurePanelOpen(scope, /Servicio|Servei/i);
 
-  const servicio = scope.locator(`text=/${SERVICIO_TEXT}/i`).first();
-  await servicio.scrollIntoViewIfNeeded().catch(() => {}); await servicio.click({ timeout });
+  // 2) click centro + servicio con estrategia robusta
+  const centroOK = await robustClickText(scope, new RegExp(CENTRO_TEXT, "i"));
+  if (!centroOK) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
 
+  const servOK = await robustClickText(scope, new RegExp(SERVICIO_TEXT, "i"));
+  if (!servOK) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
+
+  // 3) botón Siguiente
   const nexts = [
     scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
     scope.locator('button:has-text("Siguiente")').first(),
     scope.locator('button:has-text("Següent")').first(),
     scope.locator('text=/Siguiente|Següent/i').first(),
   ].filter(Boolean);
+  let clickedNext = false;
   for (const n of nexts) {
-    if (await n.isVisible().catch(() => false)) { await n.click({ timeout }); return; }
+    try {
+      const v = await n.isVisible().catch(() => false);
+      if (v) {
+        for (const tryClick of [
+          () => n.click({ timeout: 2000 }),
+          () => n.click({ timeout: 2000, force: true }),
+          () => n.evaluate(node => (node as HTMLElement).click()),
+        ]) {
+          try { await tryClick(); clickedNext = true; break; } catch {}
+        }
+      }
+      if (clickedNext) break;
+    } catch {}
   }
-  throw new Error('No se pudo pulsar "Siguiente"');
+  if (!clickedNext) throw new Error('No se pudo pulsar "Siguiente"');
 }
 
 async function checkAvailability(scope) {
@@ -179,7 +213,7 @@ async function checkAvailability(scope) {
   return (await clickableDays.count()) > 0;
 }
 
-/* ---------- main ---------- */
+/* ---------------- main ---------------- */
 
 async function run() {
   const browser = await chromium.launch({
@@ -199,51 +233,17 @@ async function run() {
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
 
   const page = await context.newPage();
-  page.on("requestfailed", (req) => console.log("[req-failed]", req.method(), req.url(), req.failure()?.errorText));
 
   try {
-    // 1) PRIMER INTENTO: deep-link a appointment
-    let ready = await tryDeepLink(page);
+    const ready = await tryDeepLink(page);
+    if (!ready) throw new Error('No se cargó la pantalla "Centro y servicio"');
 
-    // 2) FALLBACK: flujo antiguo desde home (por si el uuid caduca o cambia)
-    if (!ready) {
-      console.log("→ Deep-link no mostró 'Centro y servicio'. Probando desde /es/home");
-      const HOME_URL = `${GVA_BASE}/#/es/home`;
-      for (let attempt = 1; attempt <= 2 && !ready; attempt++) {
-        console.log(`== Home intento ${attempt} ==`);
-        await page.goto(HOME_URL, { waitUntil: "domcontentloaded", timeout });
-        await waitMaskGone(page, 15000);
-        await closeCookiesIfAny(page);
-
-        const cta = await clickCTA(page);
-        if (!cta) {
-          await page.screenshot({ path: `home_${attempt}.png`, fullPage: true }).catch(() => {});
-          fs.writeFileSync(`home_${attempt}.html`, await page.content());
-          continue;
-        }
-        ready = await onAppointmentScreen(page, 60000);
-        if (!ready) {
-          await page.screenshot({ path: `after_cta_${attempt}.png`, fullPage: true }).catch(() => {});
-          fs.writeFileSync(`after_cta_${attempt}.html`, await page.content());
-        }
-      }
-    }
-
-    if (!ready) {
-      await page.screenshot({ path: "after_cta.png", fullPage: true }).catch(() => {});
-      fs.writeFileSync("after_cta.html", await page.content());
-      throw new Error('No se cargó la pantalla "Centro y servicio"');
-    }
-
-    // 3) Flujo normal
     await selectCenterAndService(page);
 
     const available = await checkAvailability(page);
     await page.screenshot({ path: "state.png", fullPage: true }).catch(() => {});
     if (available) {
-      const msg = `⚠️ POSIBLE DISPONIBILIDAD de cita\nCentro: ${CENTRO_TEXT}\nServicio: ${SERVICIO_TEXT}`;
-      console.log(msg);
-      await notifyTelegram(msg, "state.png");
+      console.log(`⚠️ POSIBLE DISPONIBILIDAD de cita\nCentro: ${CENTRO_TEXT}\nServicio: ${SERVICIO_TEXT}`);
     } else {
       console.log(`Sin disponibilidad de cita por ahora (Centro: ${CENTRO_TEXT} · Servicio: ${SERVICIO_TEXT}).`);
     }
