@@ -1,11 +1,11 @@
 // check_cita_gva_playwright.js
+// Automatiza la búsqueda de cita en la web de la Generalitat Valenciana.
+// Compatible con GitHub Actions o ejecución local con Node.js.
+//
 // Uso local:
 //   1) npm install
 //   2) npx playwright install --with-deps chromium
-//   3) Configure .env (copiar .env.example) y ejecute: npm run check
-//
-// Variables de entorno requeridas: CENTRO_TEXT, SERVICIO_TEXT
-// Opcionales: GVA_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TIMEOUT_MS
+//   3) Configura .env (copiar .env.example) y ejecuta: npm run check
 
 import { chromium } from "playwright";
 
@@ -41,6 +41,7 @@ async function notifyTelegram(message, screenshotPath) {
       }),
     });
 
+    // Enviar captura (opcional)
     if (screenshotPath) {
       const fs = await import("fs");
       const form = new FormData();
@@ -66,12 +67,54 @@ async function run() {
   let availabilityFound = false;
 
   try {
-    // 1) Home
+    // 1) Abrir la página principal
     await page.goto(GVA_URL, { waitUntil: "domcontentloaded", timeout });
     await page.waitForLoadState("networkidle", { timeout });
 
-    // 2) Click "Solicitar cita previa"
-    await page.getByRole("button", { name: /Solicitar cita previa/i }).click({ timeout });
+    // 2) Click "Solicitar cita previa" (robusto + cookies)
+    await page.waitForLoadState("networkidle", { timeout });
+
+    // Intentar cerrar banner de cookies si aparece
+    try {
+      const cookiesCandidates = [
+        page.getByRole("button", { name: /aceptar|acepto|consentir|aceptar todas/i }),
+        page.locator('button:has-text("Aceptar")').first(),
+        page.locator('text=/Aceptar todas/i').first(),
+      ];
+      for (const c of cookiesCandidates) {
+        const visible = await c.isVisible().catch(() => false);
+        if (visible) { await c.click({ timeout: 3000 }).catch(() => {}); break; }
+      }
+    } catch { /* ignorar errores */ }
+
+    // Esperar a que el home esté visible
+    await page.waitForTimeout(1500);
+    const homeReady = page.locator('text=/Cita previa|Sistema de gestión de citas previas/i').first();
+    await homeReady.waitFor({ timeout });
+
+    // Buscar el botón "Solicitar cita previa"
+    let clicked = false;
+    const targets = [
+      page.getByRole("button", { name: /Solicitar cita previa/i }),
+      page.locator('a:has-text("Solicitar cita previa")').first(),
+      page.locator('button:has-text("Solicitar cita previa")').first(),
+      page.locator('text=/Solicitar cita previa/i').first(),
+    ];
+
+    for (const t of targets) {
+      const visible = await t.isVisible().catch(() => false);
+      if (visible) {
+        await t.scrollIntoViewIfNeeded().catch(() => {});
+        await t.click({ timeout: 5000 }).catch(() => {});
+        clicked = true;
+        break;
+      }
+    }
+
+    if (!clicked) {
+      await page.screenshot({ path: "home.png", fullPage: true });
+      throw new Error('No se encontró el botón "Solicitar cita previa"');
+    }
 
     // 3) Seleccionar centro
     await page.waitForLoadState("networkidle", { timeout });
