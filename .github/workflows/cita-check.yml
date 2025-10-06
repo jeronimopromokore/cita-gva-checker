@@ -3,7 +3,7 @@ name: GVA Cita Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *" # cada 15 minutos
+    - cron: "*/15 * * * *" # cada 15 minutos (UTC)
 
 jobs:
   check:
@@ -18,27 +18,48 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install dependencies
+      # ---------- WINDOWS ----------
+      - name: Install deps (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
         run: |
-          npm ci
+          IF EXIST package-lock.json (
+            npm ci
+          ) ELSE (
+            npm install
+          )
+          REM Asegura que el paquete 'playwright' esté instalado
+          npm i -D playwright@latest
+          REM Instala navegadores necesarios
+          npx playwright install chromium firefox
+
+      # ---------- LINUX / macOS ----------
+      - name: Install deps (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm i -D playwright@latest
           npx playwright install --with-deps chromium firefox
 
       - name: Run checker
         env:
+          # Deep-link directo a la pantalla de cita (opcional, recomendado)
           GVA_BASE: "https://sige.gva.es/qsige/citaprevia.justicia"
           APPOINTMENT_UUID: ${{ secrets.APPOINTMENT_UUID }}
-          # O bien puedes usar directamente APPOINTMENT_URL en lugar del UUID:
+          # O usa APPOINTMENT_URL directamente si lo prefieres:
           # APPOINTMENT_URL: ${{ secrets.APPOINTMENT_URL }}
 
+          # Selección y notificaciones
           CENTRO_TEXT: ${{ secrets.CENTRO_TEXT }}
           SERVICIO_TEXT: ${{ secrets.SERVICIO_TEXT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          HEADLESS: "true"
+
+          # Ejecución
+          HEADLESS: "false"          # pon "true" si no quieres que se abra la ventana
           TIMEOUT_MS: "180000"
-          BROWSER_CHANNEL: "chrome"
-        run: |
-          npm run check
+          BROWSER_CHANNEL: "chrome"  # si usas el script con Chromium/Chrome
+        run: npm run check
 
       - name: Upload debug artifacts
         if: always()
@@ -50,3 +71,4 @@ jobs:
             *.html
             videos/
             traces/
+          if-no-files-found: ignore
