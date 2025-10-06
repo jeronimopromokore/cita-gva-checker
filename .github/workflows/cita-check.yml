@@ -23,7 +23,6 @@ jobs:
 
       - name: Run checker
         env:
-          GVA_URL: ${{ secrets.GVA_URL }}
           CENTRO_TEXT: ${{ secrets.CENTRO_TEXT }}
           SERVICIO_TEXT: ${{ secrets.SERVICIO_TEXT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
