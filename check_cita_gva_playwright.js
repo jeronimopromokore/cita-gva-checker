@@ -1,5 +1,6 @@
 // check_cita_gva_playwright.js
-// Selección de SERVICIO con fallback: primera opción visible + teclado.
+// Deep-link + acordeones + selección robusta para CENTRO y SERVICIO
+// (texto, REGEX o índice), compatible con overlays PrimeNG y listas con scroll.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -9,29 +10,39 @@ const {
   GVA_BASE = "https://sige.gva.es/qsige/citaprevia.justicia",
   APPOINTMENT_UUID,
   APPOINTMENT_URL,
-  CENTRO_TEXT,
+
+  // ---- Centro
+  CENTRO_TEXT,            // p.ej. "VALENCIA - Ciudad de la Justicia"
+  CENTRO_REGEX,           // p.ej. "valen.*justicia"
+  CENTRO_INDEX,           // p.ej. "0" (primera opción visible)
+
+  // ---- Servicio
   SERVICIO_TEXT,
-  SERVICIO_REGEX,          // opcional
-  SERVICIO_INDEX,          // opcional (0 = primera opción)
+  SERVICIO_REGEX,
+  SERVICIO_INDEX,
+
   TIMEOUT_MS = "180000",
   HEADLESS = "false",
   BROWSER_CHANNEL = "chrome",
 } = process.env;
 
-if (!CENTRO_TEXT) {
-  console.error("Falta la variable de entorno CENTRO_TEXT");
-  process.exit(1);
-}
 const timeout = Number(TIMEOUT_MS) || 180000;
 const VIDEOS_DIR = path.resolve("videos");
 const TRACES_DIR = path.resolve("traces");
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-const norm = (s) =>
-  (s || "").toString().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+/* ---------------- utils ---------------- */
 
-function escRe(s){return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
+function escRe(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
+
+const norm = (s) =>
+  (s || "").toString()
+  .normalize("NFD")
+  .replace(/[\u0300-\u036f]/g, "")
+  .replace(/\s+/g, " ")
+  .trim()
+  .toLowerCase();
 
 async function waitMaskGone(scope, maxMs = 45000) {
   const end = Date.now() + maxMs;
@@ -41,10 +52,12 @@ async function waitMaskGone(scope, maxMs = 45000) {
     scope.locator(".v-progress-circular, .spinner, .loading"),
   ];
   while (Date.now() < end) {
-    let any = false;
-    for (const m of masks) if (await m.first().isVisible().catch(()=>false)) { any = true; break; }
-    if (!any) {
-      await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(()=>{});
+    let anyVisible = false;
+    for (const m of masks) {
+      if (await m.first().isVisible().catch(() => false)) { anyVisible = true; break; }
+    }
+    if (!anyVisible) {
+      await scope.waitForLoadState?.("networkidle", { timeout: 8000 }).catch(() => {});
       await scope.waitForTimeout?.(200);
       return true;
     }
@@ -94,7 +107,8 @@ async function tryDeepLink(page) {
   return ok;
 }
 
-/* -------- acordeones -------- */
+/* ---------------- acordeones ---------------- */
+
 async function expandAllAccordions(scope) {
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link');
   const n = await headers.count();
@@ -110,6 +124,7 @@ async function expandAllAccordions(scope) {
     }
   }
 }
+
 async function ensurePanelOpen(scope, titleRe) {
   const h = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link').filter({hasText:titleRe}).first();
   const expanded = await h.getAttribute("aria-expanded").catch(()=>null);
@@ -120,12 +135,24 @@ async function ensurePanelOpen(scope, titleRe) {
     await scope.waitForTimeout(120);
   }
 }
+
 function panelContent(scope, titleRe) {
   const tab = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link').filter({ hasText: titleRe }).first();
   return tab.locator('xpath=following::*[contains(@class,"p-accordion-content") or @role="region" or contains(@class,"p-panel-content")][1]');
 }
 
-/* -------- selección servicio -------- */
+/* ---------------- selección/overlay ---------------- */
+
+function idxFromEnv(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+function rxFromEnv(raw) {
+  if (!raw) return null;
+  try { return new RegExp(raw, "i"); } catch { console.warn("Regex inválida:", raw); return null; }
+}
+
 async function dumpOptions(locator, outPath) {
   try {
     const n = await locator.count();
@@ -138,22 +165,11 @@ async function dumpOptions(locator, outPath) {
   } catch {}
 }
 
-function rxFromEnv() {
-  if (!SERVICIO_REGEX) return null;
-  try { return new RegExp(SERVICIO_REGEX, "i"); } catch { console.warn("SERVICIO_REGEX inválido"); return null; }
-}
-function idxFromEnv() {
-  if (SERVICIO_INDEX === undefined || SERVICIO_INDEX === null) return null;
-  const n = Number(SERVICIO_INDEX);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function openServiceControl(container, page) {
-  // intenta abrir dropdown/autocomplete/combobox del panel Servicio
+async function openControl(container, page) {
   const trigger = container.locator(
     '.p-dropdown, .p-autocomplete, [role="combobox"], .p-listbox'
   ).first();
-  const input = container.locator('input[type="text"], input[role="combobox"], .p-inputtext input, .p-dropdown-filter').first();
+  const input = container.locator('input[type="text"], input[role="combobox"], .p-dropdown-filter, .p-inputtext input').first();
 
   if (await trigger.isVisible().catch(()=>false)) {
     const btn = trigger.locator('.p-dropdown-trigger, .p-autocomplete-dropdown, .p-dropdown-trigger-icon').first();
@@ -166,24 +182,23 @@ async function openServiceControl(container, page) {
   } else if (await input.isVisible().catch(()=>false)) {
     await input.click({timeout:1200}).catch(()=>{});
   }
-  return { trigger, input };
+  return {trigger, input};
 }
-async function selectFromOverlay(page, target) {
+
+async function selectFromGlobalOverlay(page, rxOrText, indexOrNull) {
   const overlay = page.locator('.p-dropdown-panel:visible, .p-autocomplete-panel:visible, .p-overlaypanel:visible, .p-select-overlay:visible').first();
-  const visible = await overlay.isVisible().catch(()=>false);
-  if (!visible) return false;
+  if (!(await overlay.isVisible().catch(()=>false))) return false;
 
   // dumps
   try { fs.writeFileSync("overlay.html", await overlay.innerHTML()); await page.screenshot({path:"overlay.png", fullPage:true}).catch(()=>{}); } catch {}
-  await dumpOptions(overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a'), "services_found.txt");
+  await dumpOptions(overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a'), "options_overlay.txt");
 
-  // por índice directo
-  const idx = idxFromEnv();
-  if (idx !== null) {
+  // por índice
+  if (indexOrNull !== null) {
     const all = overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a');
     const count = await all.count();
-    if (count > idx) {
-      const el = all.nth(idx);
+    if (count > indexOrNull) {
+      const el = all.nth(indexOrNull);
       for (const f of [()=>el.click({timeout:1200}), ()=>el.click({timeout:1200,force:true}), ()=>el.evaluate(e=>e&&e.click())]) {
         try { await f(); return true; } catch {}
       }
@@ -192,7 +207,8 @@ async function selectFromOverlay(page, target) {
   }
 
   // por regex/texto
-  const rx = target instanceof RegExp ? target : new RegExp(escRe(target), "i");
+  if (!rxOrText) return false;
+  const rx = rxOrText instanceof RegExp ? rxOrText : new RegExp(escRe(rxOrText), "i");
   const cand = overlay
     .getByRole("option",{name:rx}).first()
     .or(overlay.locator(`.p-dropdown-item:has-text(/${rx.source}/${rx.flags})`).first())
@@ -208,7 +224,7 @@ async function selectFromOverlay(page, target) {
     }
   }
 
-  // scroll overlay y reintento
+  // scroll y reintento
   for (let step=0; step<20; step++){
     const sc = await overlay.evaluate(node=>{
       const el = node; if (!el) return false;
@@ -216,7 +232,6 @@ async function selectFromOverlay(page, target) {
       return el.scrollTop !== before;
     }).catch(()=>false);
     if (!sc) break;
-    await dumpOptions(overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a'), "services_found.txt");
     if (await cand.isVisible().catch(()=>false)) {
       for (const f of [()=>cand.click({timeout:1200}), ()=>cand.click({timeout:1200,force:true}), ()=>cand.evaluate(e=>e&&e.click())]) {
         try { await f(); return true; } catch {}
@@ -225,109 +240,126 @@ async function selectFromOverlay(page, target) {
   }
   return false;
 }
-async function selectFirstVisibleOption(page) {
-  // overlay primero
-  const overlay = page.locator('.p-dropdown-panel:visible, .p-autocomplete-panel:visible, .p-overlaypanel:visible, .p-select-overlay:visible').first();
-  if (await overlay.isVisible().catch(()=>false)) {
-    const all = overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a');
-    // intenta la primera visible
-    for (let i=0;i<Math.min(10, await all.count()); i++){
-      const el = all.nth(i);
-      if (await el.isVisible().catch(()=>false)) {
-        for (const f of [()=>el.click({timeout:1000}), ()=>el.click({timeout:1000,force:true}), ()=>el.evaluate(e=>e&&e.click())]) {
+
+async function selectFromContainer(container, page, rxOrText, indexOrNull) {
+  // intentar overlay vía trigger
+  const {trigger, input} = await openControl(container, page);
+  await page.waitForTimeout(200);
+
+  // si hay input y tenemos texto, filtra
+  if (await input.isVisible().catch(()=>false) && typeof rxOrText === "string" && rxOrText) {
+    await input.fill(""); await input.type(rxOrText, {delay:25});
+    await page.waitForTimeout(300);
+  }
+
+  // overlay si aparece
+  const okOverlay = await selectFromGlobalOverlay(page, rxOrText, indexOrNull);
+  if (okOverlay) return true;
+
+  // lista embebida con scroll
+  const list = container.locator('[role="listbox"], .p-listbox, ul, .p-select-list, .p-radiobutton-group').first();
+  if (await list.isVisible().catch(()=>false)) {
+    await dumpOptions(list.locator('[role="option"], li, label, button, a'), "options_list.txt");
+
+    // por índice
+    if (indexOrNull !== null) {
+      const all = list.locator('[role="option"], li, label, button, a');
+      if ((await all.count()) > indexOrNull) {
+        const el = all.nth(indexOrNull);
+        for (const f of [()=>el.click({timeout:1200}), ()=>el.click({timeout:1200,force:true}), ()=>el.evaluate(e=>e&&e.click())]) {
+          try { await f(); return true; } catch {}
+        }
+      }
+      return false;
+    }
+
+    // por regex/texto
+    if (rxOrText) {
+      const rx = rxOrText instanceof RegExp ? rxOrText : new RegExp(escRe(rxOrText), "i");
+      const cand = list
+        .getByRole("option",{name:rx}).first()
+        .or(list.locator(`li:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(list.locator(`label:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(list.locator(`button:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(list.locator(`a:has-text(/${rx.source}/${rx.flags})`).first());
+      if (await cand.isVisible().catch(()=>false)) {
+        for (const f of [()=>cand.click({timeout:1200}), ()=>cand.click({timeout:1200,force:true}), ()=>cand.evaluate(e=>e&&e.click())]) {
           try { await f(); return true; } catch {}
         }
       }
     }
   }
-  // si no hay overlay: cualquier opción visible global
-  const any = page.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, .p-listbox li, li, label, button, a').filter({ hasText: /.+/ }).first();
+
+  // último recurso: primer elemento visible
+  const any = container.locator('[role="option"], li, label, button, a').first();
   if (await any.isVisible().catch(()=>false)) {
-    for (const f of [()=>any.click({timeout:1000}), ()=>any.click({timeout:1000,force:true}), ()=>any.evaluate(e=>e&&e.click())]) {
+    for (const f of [()=>any.click({timeout:1200}), ()=>any.click({timeout:1200,force:true}), ()=>any.evaluate(e=>e&&e.click())]) {
       try { await f(); return true; } catch {}
     }
   }
   return false;
 }
-async function selectServicio(page, container) {
-  // 1) abre control
-  const {trigger, input} = await openServiceControl(container, page);
-  await page.waitForTimeout(250);
 
-  // 2) si hay input y tenemos texto, filtra
-  const targetRx = SERVICIO_REGEX ? new RegExp(SERVICIO_REGEX,"i") : null;
-  const targetTxt = SERVICIO_TEXT || "";
-  if (await input.isVisible().catch(()=>false) && targetTxt) {
-    await input.fill(""); await input.type(targetTxt, {delay:25});
-    await page.waitForTimeout(350);
-  }
+/* ---------------- flujo selección ---------------- */
 
-  // 3) intenta selección por overlay (regex/texto/índice)
-  const target = targetRx ?? (targetTxt || "");
-  if (target) {
-    const ok = await selectFromOverlay(page, target);
-    if (ok) return true;
-  }
+async function selectByFlow(page, titleRe, outPrefix, textValue, regexValue, indexValue) {
+  const cont = panelContent(page, titleRe);
+  try { fs.writeFileSync(`${outPrefix}_panel.html`, await cont.innerHTML()); } catch {}
+  const rx = rxFromEnv(regexValue);
+  const idx = idxFromEnv(indexValue);
+  const target = rx ?? (textValue || "");
 
-  // 4) si no, selección por índice si lo diste
-  if (idxFromEnv() !== null) {
-    const ok = await selectFromOverlay(page, 0); // overlay ya abierto -> primera
-    if (ok) return true;
-  }
+  // 1) intenta overlay/list por target
+  let ok = await selectFromContainer(cont, page, target, idx);
+  if (ok) return true;
 
-  // 5) último recurso: tomar la **primera opción visible**
-  const okFirst = await selectFirstVisibleOption(page);
-  if (okFirst) return true;
-
-  // 6) todavía: intenta teclado sobre el input/trigger
+  // 2) si falla todo, intenta teclado (↓, Enter)
+  const {input, trigger} = await openControl(cont, page);
   if (await input.isVisible().catch(()=>false)) {
-    await input.focus();
+    await input.focus().catch(()=>{});
   } else if (await trigger.isVisible().catch(()=>false)) {
     await trigger.click({timeout:1000}).catch(()=>{});
   }
   await page.keyboard.press("ArrowDown").catch(()=>{});
-  await page.keyboard.press("ArrowDown").catch(()=>{});
   await page.keyboard.press("Enter").catch(()=>{});
   await page.waitForTimeout(300);
 
-  // verifica que algo quedó seleccionado (algún chip/label marcado)
-  const selectedMark = container.locator('.p-dropdown-label:not(:empty), .p-autocomplete-multiple-container .p-autocomplete-token, .p-highlight');
+  // 3) verifica algo seleccionado (label/valor no vacío)
+  const selectedMark = cont.locator('.p-dropdown-label:not(:empty), .p-autocomplete-multiple-container .p-autocomplete-token, .p-highlight');
   if (await selectedMark.first().isVisible().catch(()=>false)) return true;
 
-  // dump de fallo
-  fs.writeFileSync("fail_service.html", await page.content());
-  await page.screenshot({path:"fail_service.png", fullPage:true}).catch(()=>{});
+  // 4) dump de fallo
+  fs.writeFileSync(`${outPrefix}_fail.html`, await page.content());
+  await page.screenshot({ path: `${outPrefix}_fail.png`, fullPage: true }).catch(()=>{});
   return false;
 }
 
-/* -------- flujo principal -------- */
 async function selectCenterAndService(page) {
   await expandAllAccordions(page);
   await ensurePanelOpen(page, /Centro|Centre/i);
   await ensurePanelOpen(page, /Servicio|Servei/i);
 
   // CENTRO
-  {
-    const cont = panelContent(page, /Centro|Centre/i);
-    // estrategia simple: click por texto o primera opción visible
-    const rx = new RegExp(escRe(CENTRO_TEXT), "i");
-    let ok = await cont.getByRole("option",{name:rx}).first().click({timeout:1200}).then(()=>true).catch(()=>false);
-    if (!ok) ok = await cont.locator(`text=/${rx.source}/${rx.flags}`).first().click({timeout:1200}).then(()=>true).catch(()=>false);
-    if (!ok) {
-      // tomar primera visible
-      const any = cont.locator('[role="option"], li, label, button, a').first();
-      if (await any.isVisible().catch(()=>false)) ok = await any.click({timeout:1200}).then(()=>true).catch(()=>false);
-    }
-    if (!ok) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
-  }
+  const centroOK = await selectByFlow(
+    page,
+    /Centro|Centre/i,
+    "center",
+    CENTRO_TEXT,
+    CENTRO_REGEX,
+    CENTRO_INDEX
+  );
+  if (!centroOK) throw new Error(`No se pudo clicar el centro (usa CENTRO_TEXT / CENTRO_REGEX / CENTRO_INDEX)`);
 
-  // SERVICIO con fallback fuerte
-  {
-    const cont = panelContent(page, /Servicio|Servei/i);
-    try { fs.writeFileSync("service_panel.html", await cont.innerHTML()); } catch {}
-    const ok = await selectServicio(page, cont);
-    if (!ok) throw new Error("No se pudo clicar el servicio según todos los métodos (texto/regex/índice/primera/teclado)");
-  }
+  // SERVICIO
+  const servicioOK = await selectByFlow(
+    page,
+    /Servicio|Servei/i,
+    "service",
+    SERVICIO_TEXT,
+    SERVICIO_REGEX,
+    SERVICIO_INDEX
+  );
+  if (!servicioOK) throw new Error(`No se pudo clicar el servicio (usa SERVICIO_TEXT / SERVICIO_REGEX / SERVICIO_INDEX)`);
 
   // Siguiente
   for (const n of [
@@ -346,6 +378,8 @@ async function selectCenterAndService(page) {
   throw new Error('No se pudo pulsar "Siguiente"');
 }
 
+/* ---------------- main ---------------- */
+
 async function run() {
   const browser = await chromium.launch({
     headless: HEADLESS.toLowerCase() === "true",
@@ -360,8 +394,8 @@ async function run() {
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   });
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-  const page = await context.newPage();
 
+  const page = await context.newPage();
   try {
     const ready = await tryDeepLink(page);
     if (!ready) throw new Error('No se cargó la pantalla "Centro y servicio"');
