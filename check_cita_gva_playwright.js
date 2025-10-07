@@ -1,5 +1,5 @@
 // check_cita_gva_playwright.js
-// Deep-link + acordeones + selección de SERVICIO por similitud + volcados de opciones.
+// Deep-link + acordeones + selección de SERVICIO compatible con overlays globales de PrimeNG.
 
 import { chromium } from "playwright";
 import fs from "fs";
@@ -27,7 +27,7 @@ const TRACES_DIR = path.resolve("traces");
 fs.mkdirSync(VIDEOS_DIR, { recursive: true });
 fs.mkdirSync(TRACES_DIR, { recursive: true });
 
-/* ---------- utilidades ---------- */
+/* ---------------- utils ---------------- */
 
 const norm = (s) =>
   (s || "")
@@ -39,12 +39,10 @@ const norm = (s) =>
     .toLowerCase();
 
 function similarityScore(targetNorm, optionNorm) {
-  // puntuación simple: presencia de tokens + contains global
   const tks = targetNorm.split(/\s+/).filter(Boolean);
   let score = 0;
   if (optionNorm.includes(targetNorm)) score += 5;
   for (const tk of tks) if (tk.length > 2 && optionNorm.includes(tk)) score += 1;
-  // pequeño bonus por longitud parecida
   const lenDiff = Math.abs(optionNorm.length - targetNorm.length);
   if (lenDiff <= 5) score += 1;
   return score;
@@ -121,7 +119,7 @@ async function tryDeepLink(page) {
   return ok;
 }
 
-/* ---------- acordeones ---------- */
+/* ---------------- acordeones ---------------- */
 
 async function expandAllAccordions(scope) {
   const headers = scope.locator('a[role="tab"], .p-accordion-header, .p-accordion-header-link');
@@ -171,152 +169,195 @@ function panelContent(scope, titleRe) {
   return container;
 }
 
-/* ---------- extracción y selección por similitud ---------- */
+/* ---------------- selección de opciones ---------------- */
 
-async function listOptionsIn(container) {
-  // Diferentes selectores típicos de PrimeNG
-  const selectors = [
-    'li', 'label', 'button', 'a',
-    '[role="option"]', '[role="radio"]', '[role="menuitem"]', '[role="treeitem"]',
-    '.p-dropdown-item', '.p-autocomplete-item', '.p-select-list-item', '.p-radiobutton-box + label'
-  ];
-  const texts = new Set();
-  for (const sel of selectors) {
-    const items = container.locator(sel);
-    const n = await items.count();
+async function dumpOptions(locator, outPath) {
+  try {
+    const n = await locator.count();
+    const out = [];
     for (let i = 0; i < n; i++) {
-      const t = norm(await items.nth(i).innerText().catch(() => ""));
-      if (t) texts.add(t);
+      const txt = await locator.nth(i).innerText().catch(() => "");
+      if (txt && txt.trim()) out.push(norm(txt));
     }
-  }
-  const list = Array.from(texts);
-  // dump para depurar
-  try { fs.writeFileSync("services_found.txt", list.join("\n"), "utf8"); } catch {}
-  return list;
+    if (out.length) fs.writeFileSync(outPath, out.join("\n"), "utf8");
+  } catch {}
 }
 
-async function chooseBestOption(container, targetText) {
-  const target = norm(targetText);
-  // 1) intenta inputs de búsqueda
-  const inputs = container.locator('input[role="combobox"], input[type="search"], input[type="text"], .p-inputtext input, .p-autocomplete input, .p-dropdown-filter');
-  if (await inputs.count() > 0) {
-    const inp = inputs.first();
-    try {
-      await inp.scrollIntoViewIfNeeded().catch(()=>{});
-      await inp.fill("");
-      await inp.type(targetText, { delay: 25 });
-      await container.waitForTimeout(600);
-      // intenta seleccionar la primera opción visible
-      const popup = container.locator('[role="option"], .p-autocomplete-item, .p-dropdown-item').filter({ hasText: new RegExp(targetText, "i") }).first();
-      if (await popup.isVisible().catch(()=>false)) {
-        for (const clickTry of [
-          () => popup.click({ timeout: 1500 }),
-          () => popup.click({ timeout: 1500, force: true }),
-          () => popup.evaluate(el => el && el.click()),
-        ]) { try { await clickTry(); return true; } catch {} }
-      } else {
-        // alternativo: Enter
-        await inp.press("Enter").catch(()=>{});
-        await container.waitForTimeout(400);
+async function selectFromGlobalOverlay(page, targetText) {
+  // Abre el overlay ya debe estar abierto antes de llamar a esto.
+  const rx = new RegExp(targetText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  const overlay = page.locator(
+    '.p-dropdown-panel:visible, .p-autocomplete-panel:visible, .p-overlaypanel:visible, .p-select-overlay:visible'
+  ).first();
+
+  // dump visible options
+  await dumpOptions(overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a'), "services_found.txt");
+
+  const candidate = overlay
+    .getByRole("option", { name: rx }).first()
+    .or(overlay.locator(`.p-dropdown-item:has-text(/${rx.source}/${rx.flags})`).first())
+    .or(overlay.locator(`.p-autocomplete-item:has-text(/${rx.source}/${rx.flags})`).first())
+    .or(overlay.locator(`li:has-text(/${rx.source}/${rx.flags})`).first())
+    .or(overlay.locator(`label:has-text(/${rx.source}/${rx.flags})`).first())
+    .or(overlay.locator(`button:has-text(/${rx.source}/${rx.flags})`).first())
+    .or(overlay.locator(`a:has-text(/${rx.source}/${rx.flags})`).first());
+
+  const vis = await candidate.isVisible().catch(()=>false);
+  if (vis) {
+    for (const clickTry of [
+      () => candidate.click({ timeout: 1500 }),
+      () => candidate.click({ timeout: 1500, force: true }),
+      () => candidate.evaluate(el => el && el.click()),
+      async () => {
+        const box = await candidate.boundingBox();
+        if (!box) throw new Error("no-bbox");
+        await page.mouse.move(box.x + box.width/2, box.y + box.height/2);
+        await page.mouse.down(); await page.mouse.up();
       }
-    } catch {}
+    ]) { try { await clickTry(); return true; } catch {} }
   }
 
-  // 2) lista completa con scroll + similitud
-  const MAX_STEPS = 30;
-  let bestLoc = null, bestScore = -1, bestText = "";
-
+  // Si no se ve, intentar scroll interno del overlay
+  const MAX_STEPS = 20;
   for (let step = 0; step < MAX_STEPS; step++) {
-    const options = await listOptionsIn(container);
-    for (const optText of options) {
-      const score = similarityScore(target, optText);
-      if (score > bestScore) {
-        bestScore = score;
-        bestText = optText;
-      }
-    }
-    if (bestScore >= 2) {
-      // obtiene locator del mejor candidato por texto
-      const rx = new RegExp(bestText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      bestLoc = container.locator(`[role="option"] >> text=/${rx.source}/${rx.flags}`)
-        .first()
-        .or(container.locator(`.p-dropdown-item:has-text(/${rx.source}/${rx.flags})`).first())
-        .or(container.locator(`.p-autocomplete-item:has-text(/${rx.source}/${rx.flags})`).first())
-        .or(container.locator(`li:has-text(/${rx.source}/${rx.flags})`).first())
-        .or(container.locator(`label:has-text(/${rx.source}/${rx.flags})`).first())
-        .or(container.locator(`button:has-text(/${rx.source}/${rx.flags})`).first())
-        .or(container.locator(`a:has-text(/${rx.source}/${rx.flags})`).first());
-      if (bestLoc) break;
-    }
-
-    // scroll si aún no hay buen match
-    const scrolled = await container.evaluate((node) => {
+    const scrolled = await overlay.evaluate((node) => {
       if (!node) return false;
       const el = node;
       const before = el.scrollTop;
-      el.scrollTop = Math.min(el.scrollTop + 400, el.scrollHeight);
+      el.scrollTop = Math.min(el.scrollTop + 350, el.scrollHeight);
       return el.scrollTop !== before;
     }).catch(()=>false);
-    if (!scrolled) { await container.page().mouse.wheel(0, 600).catch(()=>{}); }
-    await container.page().waitForTimeout(180);
+    await dumpOptions(overlay.locator('[role="option"], .p-dropdown-item, .p-autocomplete-item, li, label, button, a'), "services_found.txt");
+
+    const nowVis = await candidate.isVisible().catch(()=>false);
+    if (nowVis) {
+      for (const clickTry of [
+        () => candidate.click({ timeout: 1500 }),
+        () => candidate.click({ timeout: 1500, force: true }),
+        () => candidate.evaluate(el => el && el.click()),
+      ]) { try { await clickTry(); return true; } catch {} }
+    }
+    if (!scrolled) break;
+    await page.waitForTimeout(150);
   }
-
-  if (!bestLoc) return false;
-
-  // 3) clic del candidato
-  try {
-    await bestLoc.scrollIntoViewIfNeeded().catch(()=>{});
-    for (const clickTry of [
-      () => bestLoc.click({ timeout: 1500 }),
-      () => bestLoc.click({ timeout: 1500, force: true }),
-      () => bestLoc.evaluate(el => el && el.click()),
-      async () => {
-        const box = await bestLoc.boundingBox();
-        if (box) {
-          await container.page().mouse.move(box.x + box.width/2, box.y + box.height/2);
-          await container.page().mouse.down(); await container.page().mouse.up();
-        } else {
-          throw new Error("no-bbox");
-        }
-      },
-    ]) { try { await clickTry(); return true; } catch {} }
-  } catch {}
   return false;
 }
 
-/* ---------- flujo de selección ---------- */
+async function selectFromContainer(container, page, targetText) {
+  const rx = new RegExp(targetText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  // 1) intenta controles dentro del contenedor
+  const triggers = container.locator(
+    '.p-dropdown, .p-autocomplete, .p-selectbutton, .p-listbox, .p-radiobutton, [role="combobox"], [role="listbox"]'
+  );
+  if (await triggers.count() > 0) {
+    // prioriza dropdown/autocomplete
+    for (const pref of ['.p-dropdown', '.p-autocomplete', '[role="combobox"]']) {
+      const t = triggers.locator(pref).first();
+      if (await t.isVisible().catch(()=>false)) {
+        // abre panel: click en trigger o en el input
+        const triggerBtn = t.locator('.p-dropdown-trigger, .p-autocomplete-dropdown, .p-dropdown-trigger-icon').first();
+        const input = t.locator('input[type="text"], input[role="combobox"], .p-inputtext input').first();
+        if (await triggerBtn.isVisible().catch(()=>false)) {
+          await triggerBtn.click({ timeout: 1500 }).catch(()=>{});
+        } else if (await input.isVisible().catch(()=>false)) {
+          await input.click({ timeout: 1500 }).catch(()=>{});
+        } else {
+          await t.click({ timeout: 1500 }).catch(()=>{});
+        }
+        await page.waitForTimeout(200);
+        // si hay input de filtro, escribe
+        if (await input.isVisible().catch(()=>false)) {
+          await input.fill("");
+          await input.type(targetText, { delay: 25 });
+          await page.waitForTimeout(300);
+        }
+        // selecciona en overlay global
+        const ok = await selectFromGlobalOverlay(page, targetText);
+        if (ok) return true;
+      }
+    }
+  }
 
-async function selectCenterAndService(scope) {
-  await expandAllAccordions(scope);
-  await ensurePanelOpen(scope, /Centro|Centre/i);
-  await ensurePanelOpen(scope, /Servicio|Servei/i);
+  // 2) si no hay overlay, intenta lista embebida con scroll
+  const MAX_STEPS = 20;
+  const list = container.locator('[role="listbox"], .p-listbox, ul, .p-select-list, .p-radiobutton-group');
+  const listExists = await list.first().isVisible().catch(()=>false);
+  if (listExists) {
+    const l = list.first();
+    await dumpOptions(l.locator('[role="option"], li, label, button, a'), "services_found.txt");
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const candidate = l
+        .getByRole("option", { name: rx }).first()
+        .or(l.locator(`li:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(l.locator(`label:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(l.locator(`button:has-text(/${rx.source}/${rx.flags})`).first())
+        .or(l.locator(`a:has-text(/${rx.source}/${rx.flags})`).first());
+      if (await candidate.isVisible().catch(()=>false)) {
+        for (const clickTry of [
+          () => candidate.click({ timeout: 1500 }),
+          () => candidate.click({ timeout: 1500, force: true }),
+          () => candidate.evaluate(el => el && el.click()),
+        ]) { try { await clickTry(); return true; } catch {} }
+      }
+      const scrolled = await l.evaluate((node) => {
+        if (!node) return false;
+        const el = node;
+        const before = el.scrollTop;
+        el.scrollTop = Math.min(el.scrollTop + 350, el.scrollHeight);
+        return el.scrollTop !== before;
+      }).catch(()=>false);
+      if (!scrolled) break;
+      await page.waitForTimeout(150);
+    }
+  }
+
+  // 3) último recurso: buscar texto suelto dentro del panel
+  const fallback = container.locator(`text=/${rx.source}/${rx.flags}`).first();
+  if (await fallback.isVisible().catch(()=>false)) {
+    for (const clickTry of [
+      () => fallback.click({ timeout: 1500 }),
+      () => fallback.click({ timeout: 1500, force: true }),
+      () => fallback.evaluate(el => el && el.click()),
+    ]) { try { await clickTry(); return true; } catch {} }
+  }
+
+  return false;
+}
+
+/* ---------------- flujo de selección ---------------- */
+
+async function selectCenterAndService(page) {
+  await expandAllAccordions(page);
+  await ensurePanelOpen(page, /Centro|Centre/i);
+  await ensurePanelOpen(page, /Servicio|Servei/i);
 
   // CENTRO
   {
-    const cont = panelContent(scope, /Centro|Centre/i);
+    const cont = panelContent(page, /Centro|Centre/i);
     const ok =
-      (await chooseBestOption(cont, CENTRO_TEXT)) ||
-      (await scope.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
+      (await selectFromContainer(cont, page, CENTRO_TEXT)) ||
+      (await page.locator(`text=/${CENTRO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
     if (!ok) throw new Error(`No se pudo clicar el centro "${CENTRO_TEXT}"`);
   }
 
-  // SERVICIO (con dump de opciones)
+  // SERVICIO (overlay-aware)
   {
-    const cont = panelContent(scope, /Servicio|Servei/i);
+    const cont = panelContent(page, /Servicio|Servei/i);
     try { fs.writeFileSync("service_panel.html", await cont.innerHTML()); } catch {}
     const ok =
-      (await chooseBestOption(cont, SERVICIO_TEXT)) ||
-      (await scope.locator(`text=/${SERVICIO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
+      (await selectFromContainer(cont, page, SERVICIO_TEXT)) ||
+      (await selectFromGlobalOverlay(page, SERVICIO_TEXT)) ||
+      (await page.locator(`text=/${SERVICIO_TEXT}/i`).first().click({ timeout: 1500 }).then(()=>true).catch(()=>false));
     if (!ok) throw new Error(`No se pudo clicar el servicio "${SERVICIO_TEXT}"`);
   }
 
   // Siguiente
   const nexts = [
-    scope.getByRole?.("button", { name: /Siguiente|Següent/i }).first(),
-    scope.locator('button:has-text("Siguiente")').first(),
-    scope.locator('button:has-text("Següent")').first(),
-    scope.locator('text=/Siguiente|Següent/i').first(),
-  ].filter(Boolean);
+    page.getByRole("button", { name: /Siguiente|Següent/i }).first(),
+    page.locator('button:has-text("Siguiente")').first(),
+    page.locator('button:has-text("Següent")').first(),
+    page.locator('text=/Siguiente|Següent/i').first(),
+  ];
   for (const n of nexts) {
     const v = await n.isVisible().catch(() => false);
     if (v) {
@@ -330,7 +371,7 @@ async function selectCenterAndService(scope) {
   throw new Error('No se pudo pulsar "Siguiente"');
 }
 
-/* ---------- main ---------- */
+/* ---------------- main ---------------- */
 
 async function run() {
   const browser = await chromium.launch({
